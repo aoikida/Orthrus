@@ -3,6 +3,8 @@ project(SCEE)
 
 option(ENABLE_LSMTREE "Build LSMTree" OFF)
 option(ENABLE_FJ "Only Fault Injection (WIP)" OFF)
+option(ENABLE_PHOENIX "Build Phoenix benchmark" ON)
+option(ENABLE_MASSTREE "Build Masstree benchmark" ON)
 
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
@@ -41,7 +43,9 @@ add_subdirectory(third/HdrHistogram_c)
 include_directories(third/HdrHistogram_c/include)
 # find_package(hdr_histogram REQUIRED)
 
-find_package(Boost REQUIRED COMPONENTS program_options)
+if (ENABLE_PHOENIX)
+    find_package(Boost REQUIRED COMPONENTS program_options)
+endif()
 
 add_subdirectory(third/isal-crc)
 include_directories(third/isal-crc/include)
@@ -85,6 +89,7 @@ add_library(${TARGET} scee.cpp)
 target_link_libraries(${TARGET} PRIVATE  mimalloc-static profile-disable)
 target_compile_definitions(${TARGET} PRIVATE DISABLE_SCEE)
 set(LIBS_disabled scee_disabled Threads::Threads  mimalloc-static profile-disable)
+set(LIBS_disabled_no_mimalloc scee_disabled Threads::Threads profile-disable)
 
 set(TARGET scee_disabled_profile)
 add_library(${TARGET} scee.cpp)

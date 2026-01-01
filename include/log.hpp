@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <boost/lockfree/spsc_queue.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -74,6 +73,7 @@ struct LogHead {
     uint32_t reclaimed;
     uint64_t gc_tsc;
     uint64_t start_us;
+    std::atomic<uint32_t>* validation_ticket;
 };
 
 struct LogTail {
@@ -127,6 +127,11 @@ inline void *allocate_log_buffer() {
 
 // reclaim a log
 inline void reclaim_log(LogHead *log) {
+    if (log->validation_ticket != nullptr) {
+        log->validation_ticket->store(1, std::memory_order_release);
+        log->validation_ticket->notify_one();
+        log->validation_ticket = nullptr;
+    }
     closure_start_log.validated_closure(log->gc_tsc,
                                         &app_thread_gc_instance->free_log);
     LogBufferHead *buffer = get_log_buffer_head(log);
@@ -230,6 +235,7 @@ inline void new_log() {
     log->reclaimed = 0;
     log->gc_tsc = closure_start_log.new_closure();
     log->start_us = profile::get_us_abs();
+    log->validation_ticket = nullptr;
     manager->current_log.head = log;
     manager->current_log.cursor = add_byte_offset(log, sizeof(LogHead));
 }
@@ -279,7 +285,7 @@ inline void unroll_log(log_cursor_t cursor) {
     get_current_log()->cursor = cursor;
 }
 
-inline void commit_log() {
+inline void commit_log(std::atomic<uint32_t>* validation_ticket = nullptr) {
     static size_t logsize = 0;
     auto *manager = get_thread_log_manager();
     auto log = manager->current_log;
@@ -287,6 +293,7 @@ inline void commit_log() {
     log.cursor = add_byte_offset(log.cursor, sizeof(LogTail));
     uint32_t log_length = ptr_distance(log.head, log.cursor);
     log.head->length = log_length;
+    log.head->validation_ticket = validation_ticket;
     *log_tail = {.length = log_length, .magic = LogTail::MAGIC};
     manager->allocator.commit(log.head);
     if (log_length > logsize) {

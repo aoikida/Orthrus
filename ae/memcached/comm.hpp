@@ -101,6 +101,32 @@ struct fd_reader {
     }
 };
 
+// If the packet starts with "<digits>#", consume the prefix and return the CRC.
+// This is used to pass a sender-computed CRC into libsei's __begin().
+static inline bool consume_crc_prefix(char *&packet, size_t &len,
+                                      uint32_t &crc_out) {
+    if (len == 0) return false;
+    if (packet[0] < '0' || packet[0] > '9') return false;
+
+    void *hash_pos = memchr(packet, '#', len);
+    if (hash_pos == nullptr) return false;
+
+    uint64_t crc = 0;
+    for (char *p = packet; p < hash_pos; ++p) {
+        const char ch = *p;
+        if (ch < '0' || ch > '9') return false;
+        crc = crc * 10 + static_cast<uint64_t>(ch - '0');
+        if (crc > UINT32_MAX) return false;
+    }
+
+    const size_t prefix_len =
+        static_cast<size_t>(static_cast<char *>(hash_pos) - packet) + 1;
+    packet = static_cast<char *>(hash_pos) + 1;
+    len -= prefix_len;
+    crc_out = static_cast<uint32_t>(crc);
+    return true;
+}
+
 static inline int connect_server(std::string ip, int port) {
     struct sockaddr_in server_addr;
     int fd;

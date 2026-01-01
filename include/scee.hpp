@@ -43,12 +43,20 @@ struct Closure : public Validable {
 template <typename Ret, typename... Args>
 Ret run(Ret (*fn)(Args...), Args... args) {
     static_assert(std::is_trivial_v<Ret>);
+#ifdef SCEE_SYNC_VALIDATE
+    std::atomic<uint32_t> validation_ticket{0};
+#endif
     new_log();
     const auto *func =
         append_log_typed(Closure(fn, std::forward<Args>(args)...));
     Ret ret = func->run();
     append_log_typed(ret);
+#ifdef SCEE_SYNC_VALIDATE
+    commit_log(&validation_ticket);
+    validation_ticket.wait(0, std::memory_order_acquire);
+#else
     commit_log();
+#endif
     return ret;
 }
 
@@ -57,16 +65,29 @@ Ret run2(Ret (*app_fn)(Args...), Ret (*val_fn)(Args...), Args... args) {
     static_assert(std::is_void_v<Ret> ||
                   (std::is_trivially_copyable_v<Ret> &&
                    std::is_trivially_destructible_v<Ret>));
+#ifdef SCEE_SYNC_VALIDATE
+    std::atomic<uint32_t> validation_ticket{0};
+#endif
     new_log();
     const auto *func =
         append_log_typed(Closure(val_fn, std::forward<Args>(args)...));
     if constexpr (std::is_void_v<Ret>) {
         func->run_with_fn(app_fn);
+#ifdef SCEE_SYNC_VALIDATE
+        commit_log(&validation_ticket);
+        validation_ticket.wait(0, std::memory_order_acquire);
+#else
         commit_log();
+#endif
     } else {
         Ret ret = func->run_with_fn(app_fn);
         append_log_typed(ret);
+#ifdef SCEE_SYNC_VALIDATE
+        commit_log(&validation_ticket);
+        validation_ticket.wait(0, std::memory_order_acquire);
+#else
         commit_log();
+#endif
         return ret;
     }
     // commit_log();
@@ -79,6 +100,9 @@ Ret run2_profile(uint64_t &cycles, Ret (*app_fn)(Args...),
     static_assert(std::is_void_v<Ret> ||
                   (std::is_trivially_copyable_v<Ret> &&
                    std::is_trivially_destructible_v<Ret>));
+#ifdef SCEE_SYNC_VALIDATE
+    std::atomic<uint32_t> validation_ticket{0};
+#endif
     new_log();
     const auto *func =
         append_log_typed(Closure(val_fn, std::forward<Args>(args)...));
@@ -86,13 +110,23 @@ Ret run2_profile(uint64_t &cycles, Ret (*app_fn)(Args...),
         uint64_t start = _rdtsc();
         func->run_with_fn(app_fn);
         cycles = _rdtsc() - start;
+#ifdef SCEE_SYNC_VALIDATE
+        commit_log(&validation_ticket);
+        validation_ticket.wait(0, std::memory_order_acquire);
+#else
         commit_log();
+#endif
     } else {
         uint64_t start = _rdtsc();
         Ret ret = func->run_with_fn(app_fn);
         cycles = _rdtsc() - start;
         append_log_typed(ret);
+#ifdef SCEE_SYNC_VALIDATE
+        commit_log(&validation_ticket);
+        validation_ticket.wait(0, std::memory_order_acquire);
+#else
         commit_log();
+#endif
         return ret;
     }
 }

@@ -1,9 +1,5 @@
-import re
-import os
 import json
 import argparse
-from toolz import pipe
-from toolz.curried import partitionby, filter as tfilter, map as tmap
 
 from utils import parse
 

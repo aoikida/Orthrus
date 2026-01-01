@@ -1,6 +1,4 @@
 import re
-from toolz import pipe
-from toolz.curried import partitionby, filter as tfilter, map as tmap
 
 # client setting ngroups=3, nclients=32, nsets=50331648, ngets=524288, rps=0
 pat_mark = re.compile(r"client settting.+")
@@ -42,11 +40,44 @@ def parse(file):
         }
         return ret
 
-    is_delimiter = lambda line: line.startswith('client setting')
-    results = pipe(
-        data.strip().splitlines(),
-        partitionby(is_delimiter),
-        tfilter(lambda group: not is_delimiter(group[0])),
-        lambda xs: [_worker(x) for x in xs],
-    )
+    lines = [line.strip() for line in data.strip().splitlines() if line.strip()]
+
+    blocks = []
+    cur = None
+    for line in lines:
+        if line.startswith("client setting"):
+            if cur is not None:
+                blocks.append(cur)
+            cur = []
+            continue
+        if cur is None:
+            continue
+        cur.append(line)
+    if cur is not None:
+        blocks.append(cur)
+
+    results = []
+    for block in blocks:
+        # Prefer explicit task lines if present (more robust than fixed indices).
+        tasks = {}
+        for line in block:
+            if line.startswith("SET put "):
+                tasks["SET"] = line
+            elif line.startswith("UPDATE put "):
+                tasks["UPDATE"] = line
+            elif line.startswith("GET put "):
+                tasks["GET"] = line
+
+        xs = [
+            tasks.get("SET"),
+            tasks.get("UPDATE"),
+            tasks.get("GET"),
+        ]
+        if any(x is None for x in xs):
+            # Fallback: assume the first 3 non-delimiter lines are SET/UPDATE/GET.
+            if len(block) < 3:
+                raise Exception("invalid data: missing SET/UPDATE/GET lines")
+            xs = block[:3]
+
+        results.append(_worker(xs))
     return results

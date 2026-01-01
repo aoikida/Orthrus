@@ -63,12 +63,16 @@ struct fd_worker {
     }
     bool run() {
         while ((len = reader.read_packet())) {
-            if (!memcmp(reader.packet, "quit", 4)) return true;
-            if (reader.packet[0] == 's') {  // set
+            char *packet = reader.packet;
+            size_t packet_len = len;
+            uint32_t unused_crc = 0;
+            (void)consume_crc_prefix(packet, packet_len, unused_crc);
+            if (!memcmp(packet, "quit", 4)) return true;
+            if (packet[0] == 's') {  // set
                 Key key;
                 Val val;
-                memcpy(key.ch, reader.packet + 4, KEY_LEN);
-                memcpy(val.ch, reader.packet + 4 + KEY_LEN + 1, VAL_LEN);
+                memcpy(key.ch, packet + 4, KEY_LEN);
+                memcpy(val.ch, packet + 4 + KEY_LEN + 1, VAL_LEN);
                 RetType ret;
                 using HashmapSetType =
                     RetType (*)(scee::ptr_t<hashmap_t> *, Key, Val);
@@ -78,9 +82,9 @@ struct fd_worker {
                     reinterpret_cast<HashmapSetType>(validator::hashmap_set);
                 ret = scee::run2(app_fn, val_fn, hm_safe, key, val);
                 memcpy(wt_buffer, kRetVals[ret], strlen(kRetVals[ret]) + 1);
-            } else if (reader.packet[0] == 'g') {  // get
+            } else if (packet[0] == 'g') {  // get
                 Key key;
-                memcpy(key.ch, reader.packet + 4, KEY_LEN);
+                memcpy(key.ch, packet + 4, KEY_LEN);
                 const Val *val;
                 using HashmapGetType =
                     const Val *(*)(scee::ptr_t<hashmap_t> *, Key);
@@ -99,9 +103,9 @@ struct fd_worker {
                     memcpy(wt_buffer, kRetVals[kNotFound],
                            strlen(kRetVals[kNotFound]) + 1);
                 }
-            } else if (reader.packet[0] == 'd') {  // del
+            } else if (packet[0] == 'd') {  // del
                 Key key;
-                memcpy(key.ch, reader.packet + 4, KEY_LEN);
+                memcpy(key.ch, packet + 4, KEY_LEN);
                 RetType ret;
                 using HashmapDelType =
                     RetType (*)(scee::ptr_t<hashmap_t> *, Key);

@@ -1,119 +1,107 @@
-import os
 import re
-import json
 import argparse
-from typing import List, Dict, Any
+from typing import List
 from pathlib import Path
-from toolz.curried import map, compose, pipe, take, reduce, filter
-from toolz.recipes import partitionby
-
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input-raw", required=True, help="lsmtree-memory_status-raw.log")
+parser.add_argument("--input-sei", required=False, help="lsmtree-memory_status-sei.log")
 parser.add_argument("--input-scee", required=True, help="lsmtree-memory_status-scee.log")
-parser.add_argument("--input-rbv", required=True, action="append", help="lsmtree-memory_status-rbv.log")
+parser.add_argument(
+    "--input-scee-sync",
+    required=False,
+    help="lsmtree-memory_status-scee-sync.log",
+)
+parser.add_argument(
+    "--input-rbv",
+    required=True,
+    action="append",
+    help="lsmtree-memory_status-rbv.log",
+)
 
 args = parser.parse_args()
 
 raw_mem = Path(args.input_raw)
+sei_mem = Path(args.input_sei) if args.input_sei else None
 scee_mem = Path(args.input_scee)
+scee_sync_mem = Path(args.input_scee_sync) if args.input_scee_sync else None
 
 rbv_mems = [Path(x) for x in args.input_rbv]
 
-# DIVISION_MARK = "---- started ----"
 
 def parser(mem: Path):
     pat = re.compile(r"VmRSS:\s+(\d+) kB")
 
-    def process(line):
-        matches = pat.match(line)
-        if not matches:
-            print("="*10)
-            print(line)
-            return None
-        # print(matches[1])
-        ret = int(matches[1])
-        return ret
-
     with open(mem, "r", encoding="utf8") as f:
         data: List[str] = f.read().splitlines()
 
-    # tmp = partitionby(lambda x: x == DIVISION_MARK, data)
-    # tmp = list(tmp)
-    # init_stage = tmp[0]
-    # run_stage = tmp[2]
+    run_stage_parsed: List[int] = []
+    for line in data:
+        matches = pat.match(line)
+        if not matches:
+            continue
+        run_stage_parsed.append(int(matches[1]))
 
-    run_stage = data
-
-    f = compose(
-        map(lambda x: process(x)),
-        filter(lambda x: x),
-    )
-
-    # init_stage_parsed = list(f(init_stage))
-    run_stage_parsed = list(f(run_stage))
-    # max_init_stage_mem = max(init_stage_parsed)
+    if not run_stage_parsed:
+        raise ValueError(f"No VmRSS samples found in {mem}")
     max_run_stage_mem = max(run_stage_parsed)
     avg_run_stage_mem = sum(run_stage_parsed) // len(run_stage_parsed)
 
-    # print("max mem init: ", max_init_stage_mem)
     print("max mem run : ", max_run_stage_mem)
-    # print("mem max diff usage:    ", max_run_stage_mem - max_init_stage_mem)
-    # print("mem avg diff usage:    ", avg_run_stage_mem - max_init_stage_mem)
     return (
-        # max_init_stage_mem,
         max_run_stage_mem,
         avg_run_stage_mem,
-        # max_run_stage_mem - max_init_stage_mem,
-        # avg_run_stage_mem - max_init_stage_mem,
     )
 
 
 print("Processing raw")
-(
-    # raw_max_init_mem,
-    raw_max_run_mem,
-    raw_avg_run_mem,
-    # raw_max_diff_mem,
-    # raw_avg_diff_mem,
-) = parser(raw_mem)
+raw_max_run_mem, raw_avg_run_mem = parser(raw_mem)
+
+sei_max_run_mem = None
+sei_avg_run_mem = None
+if sei_mem is not None:
+    print("Processing sei")
+    sei_max_run_mem, sei_avg_run_mem = parser(sei_mem)
 
 print("Processing scee")
-(
-    # scee_max_init_mem,
-    scee_max_run_mem,
-    scee_avg_run_mem,
-    # scee_max_diff_mem,
-    # scee_avg_diff_mem,
-) = parser(scee_mem)
+scee_max_run_mem, scee_avg_run_mem = parser(scee_mem)
+
+scee_sync_max_run_mem = None
+scee_sync_avg_run_mem = None
+if scee_sync_mem is not None:
+    print("Processing scee(sync)")
+    scee_sync_max_run_mem, scee_sync_avg_run_mem = parser(scee_sync_mem)
 
 print("Processing rbv")
 rbv_max_run_mem = 0
 rbv_avg_run_mem = 0
 for rbv_mem in rbv_mems:
-    (
-        # rbv_max_init_mem,
-        _rbv_max_run_mem,
-        _rbv_avg_run_mem,
-        # rbv_max_diff_mem,
-        # rbv_avg_diff_mem,
-    ) = parser(rbv_mem)
+    _rbv_max_run_mem, _rbv_avg_run_mem = parser(rbv_mem)
     rbv_max_run_mem += _rbv_max_run_mem
     rbv_avg_run_mem += _rbv_avg_run_mem
 
 
 diff = lambda a, b: a / b
 
-print("-"*10, " results(peak) ", "-"*10)
-print("ratio (Orthrus vs Vanilla): ", diff(scee_max_run_mem, raw_max_run_mem))
+print("-" * 10, " results(peak) ", "-" * 10)
+print("ratio (Orthrus(async) vs Vanilla): ", diff(scee_max_run_mem, raw_max_run_mem))
+if scee_sync_max_run_mem is not None:
+    print(
+        "ratio (Orthrus(sync) vs Vanilla):  ",
+        diff(scee_sync_max_run_mem, raw_max_run_mem),
+    )
+if sei_max_run_mem is not None:
+    print("ratio (SEI vs Vanilla):     ", diff(sei_max_run_mem, raw_max_run_mem))
 print("ratio (RBV vs Vanilla):     ", diff(rbv_max_run_mem, raw_max_run_mem))
 
-print("-"*10, " results(avg) ", "-"*10)
-print("ratio (Orthrus vs Vanilla): ", diff(scee_avg_run_mem, raw_avg_run_mem))
+print("-" * 10, " results(avg) ", "-" * 10)
+print("ratio (Orthrus(async) vs Vanilla): ", diff(scee_avg_run_mem, raw_avg_run_mem))
+if scee_sync_avg_run_mem is not None:
+    print(
+        "ratio (Orthrus(sync) vs Vanilla):  ",
+        diff(scee_sync_avg_run_mem, raw_avg_run_mem),
+    )
+if sei_avg_run_mem is not None:
+    print("ratio (SEI vs Vanilla):     ", diff(sei_avg_run_mem, raw_avg_run_mem))
 print("ratio (RBV vs Vanilla):     ", diff(rbv_avg_run_mem, raw_avg_run_mem))
-
-# print("-"*10, " results(peak run) ", "-"*10)
-# print("ratio (RBV vs Vanilla):     ", diff(rbv_max_run_mem, raw_max_run_mem))
-# print("ratio (Orthrus vs Vanilla): ", diff(scee_max_run_mem, raw_max_run_mem))
-# print("ratio (Orthrus vs RBV):     ", diff(rbv_max_run_mem, scee_max_run_mem))

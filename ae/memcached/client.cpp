@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <cstring>
 #include <mutex>
@@ -16,6 +17,14 @@
 
 #include "common.hpp"
 #include "utils.hpp"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <sei/crc.h>
+#ifdef __cplusplus
+}
+#endif
 
 namespace monitor {
 
@@ -195,6 +204,18 @@ const double kZipfParamS = 1.16;  // to match zipfian distribution
 const uint32_t kNumPrints = 32;
 const uint32_t kMaxNumThreads = 128;
 const int kBufferSize = 1024;
+static constexpr size_t kCrcPrefixMax = 16;
+
+static inline size_t prepend_crc_prefix(char *dst, size_t prefix_capacity,
+                                        const char *payload,
+                                        size_t payload_len) {
+    const uint32_t crc = crc_compute(payload, payload_len);
+    const int prefix_len = snprintf(dst, prefix_capacity, "%u#", crc);
+    assert(prefix_len > 0);
+    assert(static_cast<size_t>(prefix_len) < prefix_capacity);
+    memmove(dst + prefix_len, payload, payload_len);
+    return static_cast<size_t>(prefix_len) + payload_len;
+}
 
 FILE *logger;
 uint32_t kNumThreads, kNumOpsPerThread;
@@ -334,7 +355,10 @@ void run_set() {
                 auto &key = all_keys[k];
                 auto &val = all_vals[k];
                 random_string(val.data, VAL_LEN, rngs[i].get());
-                size_t len = prepare_setcmd(tx_buf.data(), key.data, val.data);
+                char *payload = tx_buf.data() + kCrcPrefixMax;
+                size_t payload_len = prepare_setcmd(payload, key.data, val.data);
+                size_t len = prepend_crc_prefix(tx_buf.data(), kCrcPrefixMax,
+                                                payload, payload_len);
 
                 uint64_t timestamp = rdtsc();
                 write_all(fd, tx_buf.data(), len);
@@ -399,7 +423,10 @@ void run_get() {
                 auto &val = all_vals[zipf_key_indices[k * kNumThreads + i]];
                 char buf[VAL_LEN];
                 size_t val_len;
-                size_t len = prepare_getcmd(tx_buf.data(), key.data);
+                char *payload = tx_buf.data() + kCrcPrefixMax;
+                size_t payload_len = prepare_getcmd(payload, key.data);
+                size_t len = prepend_crc_prefix(tx_buf.data(), kCrcPrefixMax,
+                                                payload, payload_len);
                 write_all(fd, tx_buf.data(), len);
                 size_t rx_len = read(fd, rx_buf.data(), kBufferSize);
                 monitor.latency[k * kNumThreads + i] = nanosecond(p, rdtsc()) + t_offset;

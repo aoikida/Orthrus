@@ -30,6 +30,8 @@ public:
 
     void join();
     void detach();
+    std::thread::native_handle_type native_handle();
+    bool joinable() const noexcept;
 
 protected:
     std::thread thread;
@@ -79,6 +81,12 @@ inline Thread::Thread(F &&f, Args &&...args)
 inline void Thread::join() { thread.join(); }
 
 inline void Thread::detach() { thread.detach(); }
+
+inline std::thread::native_handle_type Thread::native_handle() {
+    return thread.native_handle();
+}
+
+inline bool Thread::joinable() const noexcept { return thread.joinable(); }
 
 template <typename F, typename... Args>
 inline AppThread::AppThread(F &&f, Args &&...args) {

@@ -54,6 +54,9 @@ struct fd_worker {
             }
 
             char *packet = reader.packet;
+            size_t packet_len = len;
+            uint32_t unused_crc = 0;
+            (void)consume_crc_prefix(packet, packet_len, unused_crc);
             if (packet[0] == 's') {  // set
                 Key key;
                 Val val;

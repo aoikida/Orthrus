@@ -1,3 +1,5 @@
+#include "sei_memcached.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -16,6 +18,14 @@
 
 #ifdef PROFILE_MEM
 #include "profile-mem.hpp"
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <sei.h>
+#ifdef __cplusplus
+}
 #endif
 
 hashmap_t *hm_safe = nullptr;
@@ -43,40 +53,63 @@ struct fd_worker {
         while ((len = reader.read_packet())) {
             char *packet = reader.packet;
             size_t packet_len = len;
-            uint32_t unused_crc = 0;
-            (void)consume_crc_prefix(packet, packet_len, unused_crc);
+            uint32_t input_crc = 0;
+            bool has_crc = consume_crc_prefix(packet, packet_len, input_crc);
             if (!memcmp(packet, "quit", 4)) return true;
-            if (packet[0] == 's') {  // set
-                Key key;
-                Val val;
-                memcpy(key.ch, packet + 4, KEY_LEN);
-                memcpy(val.ch, packet + 4 + KEY_LEN + 1, VAL_LEN);
-                RetType ret = hashmap_set(hm_safe, key, val);
-                memcpy(wt_buffer, kRetVals[ret], strlen(kRetVals[ret]) + 1);
-            } else if (packet[0] == 'g') {  // get
-                Key key;
-                memcpy(key.ch, packet + 4, KEY_LEN);
-                const Val *val = hashmap_get(hm_safe, key);
-                if (val != nullptr) {
-                    std::string ans = kRetVals[kValue];
-                    ans += std::string(val->ch, VAL_LEN);
-                    ans += kCrlf;
-                    memcpy(wt_buffer, ans.data(), ans.size());
-                    wt_buffer[ans.size()] = '\0';
+            size_t reply_len = 0;
+            const uint32_t crc = has_crc ? input_crc : crc_compute(packet, packet_len);
+            if (__begin(packet, packet_len, crc)) {
+                if (packet[0] == 's') {  // set
+                    Key key;
+                    Val val;
+                    memcpy(key.ch, packet + 4, KEY_LEN);
+                    memcpy(val.ch, packet + 4 + KEY_LEN + 1, VAL_LEN);
+                    const RetType ret = hashmap_set(hm_safe, key, val);
+                    const char *resp = kRetVals[ret];
+                    reply_len = strlen(resp);
+                    memcpy(wt_buffer, resp, reply_len);
+                } else if (packet[0] == 'g') {  // get
+                    Key key;
+                    memcpy(key.ch, packet + 4, KEY_LEN);
+                    const Val *val = hashmap_get(hm_safe, key);
+                    if (val != nullptr) {
+                        const char *prefix = kRetVals[kValue];
+                        const size_t prefix_len = strlen(prefix);
+                        memcpy(wt_buffer, prefix, prefix_len);
+                        memcpy(wt_buffer + prefix_len, val->ch, VAL_LEN);
+                        memcpy(wt_buffer + prefix_len + VAL_LEN, kCrlf,
+                               sizeof(kCrlf) - 1);
+                        reply_len = prefix_len + VAL_LEN + (sizeof(kCrlf) - 1);
+                    } else {
+                        const char *resp = kRetVals[kNotFound];
+                        reply_len = strlen(resp);
+                        memcpy(wt_buffer, resp, reply_len);
+                    }
+                } else if (packet[0] == 'd') {  // del
+                    Key key;
+                    memcpy(key.ch, packet + 4, KEY_LEN);
+                    const RetType ret = hashmap_del(hm_safe, key);
+                    const char *resp = kRetVals[ret];
+                    reply_len = strlen(resp);
+                    memcpy(wt_buffer, resp, reply_len);
                 } else {
-                    memcpy(wt_buffer, kRetVals[kNotFound],
-                           strlen(kRetVals[kNotFound]) + 1);
+                    const char *resp = kRetVals[kError];
+                    reply_len = strlen(resp);
+                    memcpy(wt_buffer, resp, reply_len);
                 }
-            } else if (packet[0] == 'd') {  // del
-                Key key;
-                memcpy(key.ch, packet + 4, KEY_LEN);
-                RetType ret = hashmap_del(hm_safe, key);
-                memcpy(wt_buffer, kRetVals[ret], strlen(kRetVals[ret]) + 1);
+
+                __output_append(wt_buffer, reply_len);
+                __output_done();
+                __end();
             } else {
-                memcpy(wt_buffer, kRetVals[kError],
-                       strlen(kRetVals[kError]) + 1);
+                const char *resp = kRetVals[kError];
+                reply_len = strlen(resp);
+                memcpy(wt_buffer, resp, reply_len);
+                write_all(reader.fd, wt_buffer, reply_len);
+                continue;
             }
-            write_all(reader.fd, wt_buffer, strlen(wt_buffer));
+            (void)__crc_pop();
+            write_all(reader.fd, wt_buffer, reply_len);
         }
         return false;
     }
@@ -174,7 +207,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 #ifdef PROFILE_MEM
-    profile::mem::init_mem("memcached-memory_status-vanilla.log");
+    profile::mem::init_mem("memcached-memory_status-sei.log");
     profile::mem::start();
 #endif
     uint32_t port = atoi(argv[1]);
