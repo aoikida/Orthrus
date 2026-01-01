@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import math
 import os
 import random
@@ -10,7 +11,30 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from utils import parse as parse_client_log
+
+SEI_VARIANT_CHOICES = ["er2", "er5", "er10", "dynamicNway", "core", "dynamicCore"]
+SEI_VARIANT_ALIASES = {"default": "er2"}
+
+
+def _normalize_sei_variant(variant: str) -> str:
+    v = variant.strip()
+    return SEI_VARIANT_ALIASES.get(v, v)
+
+
+def _git_sha(repo: Path) -> str:
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return "unknown"
 
 
 def _available_cpus() -> List[int]:
@@ -72,6 +96,29 @@ class CpuLayout:
     rbv_primary: List[int]
     rbv_replica: List[int]
     client: List[int]
+
+
+@dataclass(frozen=True)
+class LogFiles:
+    temp_dir: Path
+    remote_temp_dir: str
+    suffix: str
+    remote_client: bool
+    client_prefix: str
+    run_prefix: str
+
+    def local_client_log(self, name: str) -> Path:
+        return self.temp_dir / f"{self.client_prefix}-{name}{self.suffix}.log"
+
+    def client_log_arg(self, name: str) -> str:
+        if not self.remote_client:
+            return str(self.local_client_log(name))
+        return str(
+            Path(self.remote_temp_dir) / f"{self.client_prefix}-{name}{self.suffix}.log"
+        )
+
+    def run_log(self, name: str) -> Path:
+        return self.temp_dir / f"{self.run_prefix}-{name}{self.suffix}.log"
 
 
 def _choose_cpus(preset: str) -> CpuLayout:
@@ -191,6 +238,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run memcached comparison (vanilla/SEI/Orthrus/RBV) in a portable way."
     )
+
     parser.add_argument(
         "--build-dir",
         default="build",
@@ -277,10 +325,29 @@ def main() -> int:
             "Requires build/ae/memcached/memcached_orthrus_sync."
         ),
     )
+    parser.add_argument(
+        "--rbv-sync",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Also run RBV with synchronous validation "
+            "(memcached_rbv_primary --sync)."
+        ),
+    )
     parser.add_argument("--nclients", type=int, default=16)
     parser.add_argument("--nsets-exp", type=int, default=18)
     parser.add_argument("--ngets-exp", type=int, default=16)
     parser.add_argument("--rps", type=int, default=0)
+    parser.add_argument(
+        "--read-pct",
+        type=float,
+        default=None,
+        help=(
+            "If set, configure memcached_client to be read-heavy: this is the "
+            "percentage of GETs among (UPDATE+GET) after the initial SET phase "
+            "(example: 95 for ~95%% reads)."
+        ),
+    )
     parser.add_argument(
         "--rps-per-thread",
         type=float,
@@ -296,9 +363,18 @@ def main() -> int:
     parser.add_argument("--orthrus-rps", type=int, default=None)
     parser.add_argument("--rbv-rps", type=int, default=None)
     parser.add_argument(
+        "--sei-variants",
+        default=None,
+        help=(
+            "Comma-separated SEI variants to run. If set, runs all listed variants "
+            "and overrides --sei-variant. Example: er2,er5,dynamicNway"
+        ),
+    )
+    parser.add_argument(
         "--sei-variant",
-        choices=["default", "er2", "er5", "er10", "dynamicNway", "dynamicCore"],
-        default="default",
+        type=_normalize_sei_variant,
+        choices=SEI_VARIANT_CHOICES,
+        default="er2",
         help="Which SEI memcached server variant to run.",
     )
     parser.add_argument(
@@ -362,6 +438,18 @@ def main() -> int:
     if args.rps_per_thread is not None and args.rps_per_thread < 0:
         raise ValueError("--rps-per-thread must be >= 0")
 
+    client_read_pct_arg: List[str] = []
+    if args.read_pct is not None:
+        read_pct = float(args.read_pct)
+        if read_pct <= 1.0:
+            read_pct *= 100.0
+        if not (read_pct > 0.0 and read_pct <= 100.0):
+            raise ValueError(
+                "--read-pct must be in (0,100] (or provide a ratio in (0,1])."
+            )
+        args.read_pct = read_pct
+        client_read_pct_arg = [str(read_pct)]
+
     def _derive_rps(*, override: Optional[int], ngroups: int) -> int:
         if override is not None:
             if override < 0:
@@ -381,6 +469,32 @@ def main() -> int:
     orthrus_rps = _derive_rps(override=args.orthrus_rps, ngroups=args.orthrus_ngroups)
     rbv_rps = _derive_rps(override=args.rbv_rps, ngroups=args.rbv_ngroups)
 
+    allowed_sei_variants = set(SEI_VARIANT_CHOICES)
+
+    def _parse_sei_variants_arg(s: str) -> List[str]:
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("--sei-variants must be a non-empty comma-separated list")
+        out: List[str] = []
+        seen = set()
+        for p in parts:
+            p = _normalize_sei_variant(p)
+            if p not in allowed_sei_variants:
+                raise ValueError(f"Unknown SEI variant in --sei-variants: {p}")
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return out
+
+    sei_variants = (
+        _parse_sei_variants_arg(args.sei_variants)
+        if args.sei_variants is not None
+        else [args.sei_variant]
+    )
+    if len(sei_variants) > 1 and args.mode in ("memory", "all"):
+        raise ValueError("--sei-variants is only supported with --mode throughput")
+
     root = Path(__file__).resolve().parents[2]
     build_dir = (root / args.build_dir).resolve()
     temp_dir = root / "temp"
@@ -398,6 +512,7 @@ def main() -> int:
         "sei_er5": mem_dir / "memcached_sei_er5",
         "sei_er10": mem_dir / "memcached_sei_er10",
         "sei_dynamicNway": mem_dir / "memcached_sei_dynamic_nway",
+        "sei_core": mem_dir / "memcached_sei_core",
         "sei_dynamicCore": mem_dir / "memcached_sei_dynamic_core",
         "orthrus": mem_dir / "memcached_orthrus",
         "orthrus_sync": mem_dir / "memcached_orthrus_sync",
@@ -409,6 +524,7 @@ def main() -> int:
         "sei_er5_mem": mem_dir / "memcached_sei_er5_mem",
         "sei_er10_mem": mem_dir / "memcached_sei_er10_mem",
         "sei_dynamicNway_mem": mem_dir / "memcached_sei_dynamic_nway_mem",
+        "sei_core_mem": mem_dir / "memcached_sei_core_mem",
         "sei_dynamicCore_mem": mem_dir / "memcached_sei_dynamic_core_mem",
         "orthrus_mem": mem_dir / "memcached_orthrus_mem",
         "orthrus_sync_mem": mem_dir / "memcached_orthrus_sync_mem",
@@ -416,27 +532,35 @@ def main() -> int:
         "rbv_replica_mem": mem_dir / "memcached_rbv_replica_mem",
     }
 
-    sei_bin_key = {
-        "default": "sei",
-        "er2": "sei_er2",
-        "er5": "sei_er5",
-        "er10": "sei_er10",
-        "dynamicNway": "sei_dynamicNway",
-        "dynamicCore": "sei_dynamicCore",
-    }[args.sei_variant]
-    sei_mem_bin_key = {
-        "default": "sei_mem",
-        "er2": "sei_er2_mem",
-        "er5": "sei_er5_mem",
-        "er10": "sei_er10_mem",
-        "dynamicNway": "sei_dynamicNway_mem",
-        "dynamicCore": "sei_dynamicCore_mem",
-    }[args.sei_variant]
+    def _sei_bin_key(variant: str) -> str:
+        return {
+            "er2": "sei_er2",
+            "er5": "sei_er5",
+            "er10": "sei_er10",
+            "dynamicNway": "sei_dynamicNway",
+            "core": "sei_core",
+            "dynamicCore": "sei_dynamicCore",
+        }[variant]
+
+    def _sei_mem_bin_key(variant: str) -> str:
+        return {
+            "er2": "sei_er2_mem",
+            "er5": "sei_er5_mem",
+            "er10": "sei_er10_mem",
+            "dynamicNway": "sei_dynamicNway_mem",
+            "core": "sei_core_mem",
+            "dynamicCore": "sei_dynamicCore_mem",
+        }[variant]
+
+    sei_bin_keys = [_sei_bin_key(v) for v in sei_variants]
+    sei_mem_bin_key = _sei_mem_bin_key(sei_variants[0])
 
     _require_file(client_bin)
     required = set()
     if args.mode in ("throughput", "all"):
-        required |= {"vanilla", sei_bin_key, "orthrus", "rbv_primary", "rbv_replica"}
+        required |= (
+            {"vanilla", "orthrus", "rbv_primary", "rbv_replica"} | set(sei_bin_keys)
+        )
         if args.orthrus_sync:
             required.add("orthrus_sync")
     if args.mode in ("memory", "all"):
@@ -506,6 +630,60 @@ def main() -> int:
     cpus = _choose_cpus(args.preset)
     orthrus_work_cpus = cpus.server8[:-1] if len(cpus.server8) > 1 else cpus.server8
     orthrus_val_cpus = cpus.server8[-1:] if cpus.server8 else []
+    client_exec = str(args.remote_client_bin) if remote_client else str(client_bin)
+
+    def _pick_disjoint_ports(ngroups: int) -> Tuple[int, int]:
+        replica_port = _pick_ports(ngroups)
+        while True:
+            port = _pick_ports(ngroups)
+            if port + ngroups - 1 < replica_port or replica_port + ngroups - 1 < port:
+                return port, replica_port
+
+    def _prepare_client_log(logs: LogFiles, name: str) -> None:
+        _remove_if_exists(logs.local_client_log(name))
+        if logs.remote_client:
+            _remote_rm(logs.client_log_arg(name))
+
+    def _fetch_client_log(logs: LogFiles, name: str) -> None:
+        if logs.remote_client:
+            _remote_fetch(logs.client_log_arg(name), logs.local_client_log(name))
+
+    def _client_args(port: int, client_log: str, ngroups: int, rps: int) -> List[str]:
+        return [
+            client_exec,
+            args.server_ip,
+            str(port),
+            client_log,
+            str(ngroups),
+            str(args.nclients),
+            str(args.nsets_exp),
+            str(args.ngets_exp),
+            str(rps),
+            *client_read_pct_arg,
+        ]
+
+    def _orthrus_server_cmd(bin_path: Path, port: int) -> List[str]:
+        cmd: List[str] = [str(bin_path), str(port), str(args.orthrus_ngroups)]
+        if args.preset == "fair4c":
+            cmd = [
+                "env",
+                f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)}",
+                f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}",
+                *cmd,
+            ]
+        return cmd
+
+    def _rbv_primary_cmd(bin_path: Path, port: int, replica_port: int, mode: str) -> List[str]:
+        if mode not in ("--async", "--sync"):
+            raise ValueError(f"invalid rbv primary mode: {mode!r}")
+        return [
+            str(bin_path),
+            str(port),
+            str(args.rbv_ngroups),
+            str(replica_port),
+            "127.0.0.1",
+            mode,
+        ]
 
     if args.tag is not None:
         if "/" in args.tag or "\\" in args.tag:
@@ -531,34 +709,22 @@ def main() -> int:
     if args.tag is not None:
         config_path = results_dir / f"memcached-config.{args.tag}.txt"
         libsei_root = (root / ".." / "libsei-gcc").resolve()
-        libsei_build_dir = {
-            "default": libsei_root / "build",
+        libsei_build_dir_by_variant = {
             "er2": libsei_root / "build_er2_nomig",
             "er5": libsei_root / "build_er5_nomig",
             "er10": libsei_root / "build_er10_nomig",
             "dynamicNway": libsei_root / "build_dyn_nway_er5_rb",
+            "core": libsei_root / "build_core1_only",
             "dynamicCore": libsei_root / "build_dyn_core_rb",
-        }[args.sei_variant]
-        libsei_make_flags = {
-            "default": "(see libsei-gcc/build configuration)",
+        }
+        libsei_make_flags_by_variant = {
             "er2": "EXECUTION_REDUNDANCY=2 (no ROLLBACK, no EXECUTION_CORE_REDUNDANCY)",
             "er5": "EXECUTION_REDUNDANCY=5 (no ROLLBACK, no EXECUTION_CORE_REDUNDANCY)",
             "er10": "EXECUTION_REDUNDANCY=10 (no ROLLBACK, no EXECUTION_CORE_REDUNDANCY)",
             "dynamicNway": "ROLLBACK=1 EXECUTION_REDUNDANCY=5 (dynamic redundancy via __begin_n)",
-            "dynamicCore": "ROLLBACK=1 (dynamic core migration via __begin_core_redundancy)",
-        }[args.sei_variant]
-
-        def _git_sha(repo: Path) -> str:
-            try:
-                res = subprocess.run(
-                    ["git", "-C", str(repo), "rev-parse", "HEAD"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                return res.stdout.strip()
-            except Exception:
-                return "unknown"
+            "core": "ROLLBACK=1 EXECUTION_CORE_REDUNDANCY=1 (core redundancy)",
+            "dynamicCore": "ROLLBACK=1 EXECUTION_REDUNDANCY=2 (dynamic core migration via __begin_core_redundancy)",
+        }
 
         def _rel(p: Path) -> str:
             try:
@@ -566,7 +732,7 @@ def main() -> int:
             except Exception:
                 return str(p)
 
-        orthus_sha = _git_sha(root)
+        orthrus_sha = _git_sha(root)
         libsei_sha = _git_sha(libsei_root)
 
         config_lines = [
@@ -595,24 +761,32 @@ def main() -> int:
             ),
             f"rps_default={args.rps}",
             f"rps_per_thread={args.rps_per_thread}",
-            f"rps_by_variant: vanilla={vanilla_rps} sei={sei_rps} orthrus={orthrus_rps} rbv={rbv_rps}",
-            f"orthrus_sync={args.orthrus_sync}",
             (
-                "orthus_env: "
+                "rps_by_variant: "
+                f"vanilla={vanilla_rps} sei={sei_rps} orthrus={orthrus_rps} rbv={rbv_rps}"
+            ),
+            f"read_pct={args.read_pct if args.read_pct is not None else '(disabled)'}",
+            f"orthrus_sync={args.orthrus_sync}",
+            f"rbv_sync={args.rbv_sync}",
+            (
+                "orthrus_env: "
                 f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)} "
                 f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}"
             )
             if args.preset == "fair4c"
-            else "orthus_env: (none)",
-            f"sei_variant={args.sei_variant}",
-            f"sei_server_binary={_rel(bins[sei_bin_key])}",
+            else "orthrus_env: (none)",
+            f"sei_variants={','.join(sei_variants)}",
+            "sei_server_binaries: "
+            + " ".join(f"{v}={_rel(bins[_sei_bin_key(v)])}" for v in sei_variants),
             f"orthrus_server_binary={_rel(bins['orthrus'])}",
             f"orthrus_sync_server_binary={_rel(bins['orthrus_sync'])}"
             if args.orthrus_sync
             else "orthrus_sync_server_binary=(disabled)",
-            f"libsei_build_dir={libsei_build_dir}",
-            f"libsei_make_flags={libsei_make_flags}",
-            f"sha: Orthrus={orthus_sha}",
+            "libsei_build_dirs: "
+            + " ".join(f"{v}={libsei_build_dir_by_variant[v]}" for v in sei_variants),
+            "libsei_make_flags: "
+            + " | ".join(f"{v}={libsei_make_flags_by_variant[v]}" for v in sei_variants),
+            f"sha: Orthrus={orthrus_sha}",
             f"sha: libsei-gcc={libsei_sha}",
         ]
         config_path.write_text("\n".join(config_lines) + "\n", encoding="utf8")
@@ -623,23 +797,18 @@ def main() -> int:
             out_txt = results_dir / f"memcached-throughput-report.{args.tag}.txt"
         out_txt.write_text("", encoding="utf8")
         suffix = f".{args.tag}" if args.tag is not None else ""
-
-        def client_log_local(name: str) -> Path:
-            return temp_dir / f"memcached-throughput-client-{name}{suffix}.log"
-
-        def client_log_arg(name: str) -> str:
-            if not remote_client:
-                return str(client_log_local(name))
-            return str(Path(args.client_temp_dir) / f"memcached-throughput-client-{name}{suffix}.log")
-
-        def run_log(name: str) -> Path:
-            return temp_dir / f"run-memcached-throughput-{name}{suffix}.log"
+        logs = LogFiles(
+            temp_dir=temp_dir,
+            remote_temp_dir=args.client_temp_dir,
+            suffix=suffix,
+            remote_client=remote_client,
+            client_prefix="memcached-throughput-client",
+            run_prefix="run-memcached-throughput",
+        )
 
         # vanilla
         port = _pick_ports(args.vanilla_ngroups)
-        _remove_if_exists(client_log_local("vanilla"))
-        if remote_client:
-            _remote_rm(client_log_arg("vanilla"))
+        _prepare_client_log(logs, "vanilla")
         _run_case(
             "vanilla",
             [
@@ -650,162 +819,109 @@ def main() -> int:
                 )
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    client_log_arg("vanilla"),
-                    str(args.vanilla_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(vanilla_rps),
-                ]
-            ),
-            run_log("vanilla"),
-            args.timeout_sec,
-        )
-        if remote_client:
-            _remote_fetch(client_log_arg("vanilla"), client_log_local("vanilla"))
-
-        # sei
-        port = _pick_ports(args.sei_ngroups)
-        _remove_if_exists(client_log_local("sei"))
-        if remote_client:
-            _remote_rm(client_log_arg("sei"))
-        _run_case(
-            "sei",
-            [
-                _cmd_with_taskset(
-                    cpus.server4,
-                    [str(bins[sei_bin_key]), str(port), str(args.sei_ngroups)],
-                    args.pin,
+                _client_args(
+                    port,
+                    logs.client_log_arg("vanilla"),
+                    args.vanilla_ngroups,
+                    vanilla_rps,
                 )
-            ],
-            _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    client_log_arg("sei"),
-                    str(args.sei_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(sei_rps),
-                ]
             ),
-            run_log("sei"),
+            logs.run_log("vanilla"),
             args.timeout_sec,
         )
-        if remote_client:
-            _remote_fetch(client_log_arg("sei"), client_log_local("sei"))
+        _fetch_client_log(logs, "vanilla")
+
+        def _sei_case_name(variant: str) -> str:
+            if len(sei_variants) == 1:
+                return "sei"
+            return f"sei_{variant}"
+
+        sei_client_logs: Dict[str, Path] = {}
+        for variant in sei_variants:
+            sei_name = _sei_case_name(variant)
+            port = _pick_ports(args.sei_ngroups)
+            _prepare_client_log(logs, sei_name)
+            _run_case(
+                sei_name,
+                [
+                    _cmd_with_taskset(
+                        cpus.server4,
+                        [
+                            str(bins[_sei_bin_key(variant)]),
+                            str(port),
+                            str(args.sei_ngroups),
+                        ],
+                        args.pin,
+                    )
+                ],
+                _client_cmd(
+                    _client_args(
+                        port,
+                        logs.client_log_arg(sei_name),
+                        args.sei_ngroups,
+                        sei_rps,
+                    )
+                ),
+                logs.run_log(sei_name),
+                args.timeout_sec,
+            )
+            _fetch_client_log(logs, sei_name)
+            sei_client_logs[variant] = logs.local_client_log(sei_name)
 
         # orthrus
         port = _pick_ports(args.orthrus_ngroups)
-        _remove_if_exists(client_log_local("orthrus"))
-        if remote_client:
-            _remote_rm(client_log_arg("orthrus"))
-        orthrus_server_cmd: List[str] = [
-            str(bins["orthrus"]),
-            str(port),
-            str(args.orthrus_ngroups),
-        ]
-        if args.preset == "fair4c":
-            orthrus_server_cmd = [
-                "env",
-                f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)}",
-                f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}",
-                *orthrus_server_cmd,
-            ]
+        _prepare_client_log(logs, "orthrus")
         _run_case(
             "orthrus",
             [
                 _cmd_with_taskset(
                     cpus.server8,
-                    orthrus_server_cmd,
+                    _orthrus_server_cmd(bins["orthrus"], port),
                     args.pin,
                 )
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    client_log_arg("orthrus"),
-                    str(args.orthrus_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(orthrus_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("orthrus"),
+                    args.orthrus_ngroups,
+                    orthrus_rps,
+                )
             ),
-            run_log("orthrus"),
+            logs.run_log("orthrus"),
             args.timeout_sec,
         )
-        if remote_client:
-            _remote_fetch(client_log_arg("orthrus"), client_log_local("orthrus"))
+        _fetch_client_log(logs, "orthrus")
 
         if args.orthrus_sync:
             # Orthrus (sync validation)
             port = _pick_ports(args.orthrus_ngroups)
-            _remove_if_exists(client_log_local("orthrus_sync"))
-            if remote_client:
-                _remote_rm(client_log_arg("orthrus_sync"))
-            orthrus_sync_server_cmd: List[str] = [
-                str(bins["orthrus_sync"]),
-                str(port),
-                str(args.orthrus_ngroups),
-            ]
-            if args.preset == "fair4c":
-                orthrus_sync_server_cmd = [
-                    "env",
-                    f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)}",
-                    f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}",
-                    *orthrus_sync_server_cmd,
-                ]
+            _prepare_client_log(logs, "orthrus_sync")
             _run_case(
                 "orthrus_sync",
                 [
                     _cmd_with_taskset(
                         cpus.server8,
-                        orthrus_sync_server_cmd,
+                        _orthrus_server_cmd(bins["orthrus_sync"], port),
                         args.pin,
                     )
                 ],
                 _client_cmd(
-                    [
-                        str(client_bin) if not remote_client else str(args.remote_client_bin),
-                        args.server_ip,
-                        str(port),
-                        client_log_arg("orthrus_sync"),
-                        str(args.orthrus_ngroups),
-                        str(args.nclients),
-                        str(args.nsets_exp),
-                        str(args.ngets_exp),
-                        str(orthrus_rps),
-                    ]
+                    _client_args(
+                        port,
+                        logs.client_log_arg("orthrus_sync"),
+                        args.orthrus_ngroups,
+                        orthrus_rps,
+                    )
                 ),
-                run_log("orthrus_sync"),
+                logs.run_log("orthrus_sync"),
                 args.timeout_sec,
             )
-            if remote_client:
-                _remote_fetch(
-                    client_log_arg("orthrus_sync"), client_log_local("orthrus_sync")
-                )
+            _fetch_client_log(logs, "orthrus_sync")
 
-        # rbv
-        replica_port = _pick_ports(args.rbv_ngroups)
-        while True:
-            port = _pick_ports(args.rbv_ngroups)
-            if (
-                port + args.rbv_ngroups - 1 < replica_port
-                or replica_port + args.rbv_ngroups - 1 < port
-            ):
-                break
-        _remove_if_exists(client_log_local("rbv"))
-        if remote_client:
-            _remote_rm(client_log_arg("rbv"))
+        # rbv (async baseline)
+        port, replica_port = _pick_disjoint_ports(args.rbv_ngroups)
+        _prepare_client_log(logs, "rbv")
         _run_case(
             "rbv",
             [
@@ -816,58 +932,103 @@ def main() -> int:
                 ),
                 _cmd_with_taskset(
                     cpus.rbv_primary,
-                    [
-                        str(bins["rbv_primary"]),
-                        str(port),
-                        str(args.rbv_ngroups),
-                        str(replica_port),
-                        "127.0.0.1",
-                    ],
+                    _rbv_primary_cmd(bins["rbv_primary"], port, replica_port, "--async"),
                     args.pin,
                 ),
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    client_log_arg("rbv"),
-                    str(args.rbv_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(rbv_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("rbv"),
+                    args.rbv_ngroups,
+                    rbv_rps,
+                )
             ),
-            run_log("rbv"),
+            logs.run_log("rbv"),
             args.timeout_sec,
             server_start_interval_sec=2.0,
         )
-        if remote_client:
-            _remote_fetch(client_log_arg("rbv"), client_log_local("rbv"))
+        _fetch_client_log(logs, "rbv")
 
-        subprocess.run(
-            [
-                sys.executable,
-                str(root / "scripts" / "memcached" / "parse-throughput.py"),
-                "--input-raw",
-                str(client_log_local("vanilla")),
-                "--input-sei",
-                str(client_log_local("sei")),
-                "--input-scee",
-                str(client_log_local("orthrus")),
-                *(
-                    ["--input-scee-sync", str(client_log_local("orthrus_sync"))]
-                    if args.orthrus_sync
-                    else []
+        # rbv (sync validation)
+        if args.rbv_sync:
+            port, replica_port = _pick_disjoint_ports(args.rbv_ngroups)
+            _prepare_client_log(logs, "rbv_sync")
+            _run_case(
+                "rbv_sync",
+                [
+                    _cmd_with_taskset(
+                        cpus.rbv_replica,
+                        [str(bins["rbv_replica"]), str(replica_port), str(args.rbv_ngroups)],
+                        args.pin,
+                    ),
+                    _cmd_with_taskset(
+                        cpus.rbv_primary,
+                        _rbv_primary_cmd(bins["rbv_primary"], port, replica_port, "--sync"),
+                        args.pin,
+                    ),
+                ],
+                _client_cmd(
+                    _client_args(
+                        port,
+                        logs.client_log_arg("rbv_sync"),
+                        args.rbv_ngroups,
+                        rbv_rps,
+                    )
                 ),
-                "--input-rbv",
-                str(client_log_local("rbv")),
-                "-o",
-                str(out_txt),
-            ],
-            check=True,
-            cwd=str(root),
+                logs.run_log("rbv_sync"),
+                args.timeout_sec,
+                server_start_interval_sec=2.0,
+            )
+            _fetch_client_log(logs, "rbv_sync")
+
+        def _parse_one(path: Path) -> Dict[str, object]:
+            parsed = parse_client_log(str(path))
+            if len(parsed) != 1:
+                raise RuntimeError(f"unexpected client log format: {path} ({len(parsed)} blocks)")
+            return parsed[0]
+
+        out: Dict[str, object] = {}
+        out["vanilla"] = _parse_one(logs.local_client_log("vanilla"))
+
+        sei_out: Dict[str, object] = {v: _parse_one(p) for v, p in sei_client_logs.items()}
+        if len(sei_variants) == 1:
+            out["sei"] = sei_out[sei_variants[0]]
+        else:
+            out["sei"] = sei_out
+
+        out["orthrus"] = _parse_one(logs.local_client_log("orthrus"))
+        if args.orthrus_sync:
+            out["orthrus_sync"] = _parse_one(logs.local_client_log("orthrus_sync"))
+        out["rbv"] = _parse_one(logs.local_client_log("rbv"))
+        if args.rbv_sync:
+            out["rbv_sync"] = _parse_one(logs.local_client_log("rbv_sync"))
+
+        lines: List[str] = []
+        lines.append("vanilla running")
+        lines.append(f"throughput: {out['vanilla']['throughput']}")  # type: ignore[index]
+        if len(sei_variants) == 1:
+            lines.append("sei running")
+            lines.append(f"throughput: {out['sei']['throughput']}")  # type: ignore[index]
+        else:
+            for v in sei_variants:
+                lines.append(f"sei_{v} running")
+                lines.append(f"throughput: {sei_out[v]['throughput']}")  # type: ignore[index]
+        lines.append("orthrus running")
+        lines.append(f"throughput: {out['orthrus']['throughput']}")  # type: ignore[index]
+        if args.orthrus_sync:
+            lines.append("orthrus_sync running")
+            lines.append(f"throughput: {out['orthrus_sync']['throughput']}")  # type: ignore[index]
+        lines.append("rbv running")
+        lines.append(f"throughput: {out['rbv']['throughput']}")  # type: ignore[index]
+        if args.rbv_sync:
+            lines.append("rbv_sync running")
+            lines.append(f"throughput: {out['rbv_sync']['throughput']}")  # type: ignore[index]
+        out_txt.write_text("\n".join(lines) + "\n", encoding="utf8")
+
+        out_json = Path(f"{out_txt}.json")
+        out_json.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf8"
         )
         print(f"Wrote {out_txt}", file=sys.stderr)
 
@@ -880,17 +1041,14 @@ def main() -> int:
                 src.rename(dst)
 
         suffix = f".{args.tag}" if args.tag is not None else ""
-
-        def mem_client_log(name: str) -> Path:
-            return temp_dir / f"memcached-mem-client-{name}{suffix}.log"
-
-        def mem_client_log_arg(name: str) -> str:
-            if not remote_client:
-                return str(mem_client_log(name))
-            return str(Path(args.client_temp_dir) / f"memcached-mem-client-{name}{suffix}.log")
-
-        def run_log(name: str) -> Path:
-            return temp_dir / f"run-memcached-mem-{name}{suffix}.log"
+        logs = LogFiles(
+            temp_dir=temp_dir,
+            remote_temp_dir=args.client_temp_dir,
+            suffix=suffix,
+            remote_client=remote_client,
+            client_prefix="memcached-mem-client",
+            run_prefix="run-memcached-mem",
+        )
 
         def mem_status_log(name: str) -> Path:
             return temp_dir / f"memcached-memory_status-{name}{suffix}.log"
@@ -900,9 +1058,7 @@ def main() -> int:
         if args.orthrus_sync:
             names.append("orthrus_sync")
         for name in names:
-            _remove_if_exists(mem_client_log(name))
-            if remote_client:
-                _remote_rm(mem_client_log_arg(name))
+            _prepare_client_log(logs, name)
 
         # vanilla
         port = _pick_ports(args.vanilla_ngroups)
@@ -917,23 +1073,17 @@ def main() -> int:
                 )
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    mem_client_log_arg("vanilla"),
-                    str(args.vanilla_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(vanilla_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("vanilla"),
+                    args.vanilla_ngroups,
+                    vanilla_rps,
+                )
             ),
-            run_log("vanilla"),
+            logs.run_log("vanilla"),
             args.timeout_sec,
         )
-        if remote_client:
-            _remote_fetch(mem_client_log_arg("vanilla"), mem_client_log("vanilla"))
+        _fetch_client_log(logs, "vanilla")
         move_if_exists(
             root / "memcached-memory_status-vanilla.log",
             mem_status_log("vanilla"),
@@ -952,23 +1102,17 @@ def main() -> int:
                 )
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    mem_client_log_arg("sei"),
-                    str(args.sei_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(sei_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("sei"),
+                    args.sei_ngroups,
+                    sei_rps,
+                )
             ),
-            run_log("sei"),
+            logs.run_log("sei"),
             args.timeout_sec,
         )
-        if remote_client:
-            _remote_fetch(mem_client_log_arg("sei"), mem_client_log("sei"))
+        _fetch_client_log(logs, "sei")
         move_if_exists(
             root / "memcached-memory_status-sei.log",
             mem_status_log("sei"),
@@ -977,45 +1121,27 @@ def main() -> int:
         # orthrus
         port = _pick_ports(args.orthrus_ngroups)
         _remove_if_exists(root / "memcached-memory_status-orthrus.log")
-        orthrus_mem_server_cmd: List[str] = [
-            str(bins["orthrus_mem"]),
-            str(port),
-            str(args.orthrus_ngroups),
-        ]
-        if args.preset == "fair4c":
-            orthrus_mem_server_cmd = [
-                "env",
-                f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)}",
-                f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}",
-                *orthrus_mem_server_cmd,
-            ]
         _run_case(
             "orthrus_mem",
             [
                 _cmd_with_taskset(
                     cpus.server8,
-                    orthrus_mem_server_cmd,
+                    _orthrus_server_cmd(bins["orthrus_mem"], port),
                     args.pin,
                 )
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    mem_client_log_arg("orthrus"),
-                    str(args.orthrus_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(orthrus_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("orthrus"),
+                    args.orthrus_ngroups,
+                    orthrus_rps,
+                )
             ),
-            run_log("orthrus"),
+            logs.run_log("orthrus"),
             args.timeout_sec,
         )
-        if remote_client:
-            _remote_fetch(mem_client_log_arg("orthrus"), mem_client_log("orthrus"))
+        _fetch_client_log(logs, "orthrus")
         move_if_exists(
             root / "memcached-memory_status-orthrus.log",
             mem_status_log("orthrus"),
@@ -1025,61 +1151,34 @@ def main() -> int:
             # orthrus (sync validation)
             port = _pick_ports(args.orthrus_ngroups)
             _remove_if_exists(root / "memcached-memory_status-orthrus.log")
-            orthrus_sync_mem_server_cmd: List[str] = [
-                str(bins["orthrus_sync_mem"]),
-                str(port),
-                str(args.orthrus_ngroups),
-            ]
-            if args.preset == "fair4c":
-                orthrus_sync_mem_server_cmd = [
-                    "env",
-                    f"SCEE_WORK_CPUSET={_format_cpu_list(orthrus_work_cpus)}",
-                    f"SCEE_VALIDATION_CPUSET={_format_cpu_list(orthrus_val_cpus)}",
-                    *orthrus_sync_mem_server_cmd,
-                ]
             _run_case(
                 "orthrus_sync_mem",
                 [
                     _cmd_with_taskset(
                         cpus.server8,
-                        orthrus_sync_mem_server_cmd,
+                        _orthrus_server_cmd(bins["orthrus_sync_mem"], port),
                         args.pin,
                     )
                 ],
                 _client_cmd(
-                    [
-                        str(client_bin) if not remote_client else str(args.remote_client_bin),
-                        args.server_ip,
-                        str(port),
-                        mem_client_log_arg("orthrus_sync"),
-                        str(args.orthrus_ngroups),
-                        str(args.nclients),
-                        str(args.nsets_exp),
-                        str(args.ngets_exp),
-                        str(orthrus_rps),
-                    ]
+                    _client_args(
+                        port,
+                        logs.client_log_arg("orthrus_sync"),
+                        args.orthrus_ngroups,
+                        orthrus_rps,
+                    )
                 ),
-                run_log("orthrus_sync"),
+                logs.run_log("orthrus_sync"),
                 args.timeout_sec,
             )
-            if remote_client:
-                _remote_fetch(
-                    mem_client_log_arg("orthrus_sync"), mem_client_log("orthrus_sync")
-                )
+            _fetch_client_log(logs, "orthrus_sync")
             move_if_exists(
                 root / "memcached-memory_status-orthrus.log",
                 mem_status_log("orthrus_sync"),
-            )
+        )
 
         # rbv
-        replica_port = _pick_ports(args.rbv_ngroups)
-        while True:
-            port = _pick_ports(args.rbv_ngroups)
-            if (
-                port + args.rbv_ngroups - 1 < replica_port
-                or replica_port + args.rbv_ngroups - 1 < port
-            ):
-                break
+        port, replica_port = _pick_disjoint_ports(args.rbv_ngroups)
         _remove_if_exists(root / "memcached-memory_status-rbv-primary.log")
         _remove_if_exists(root / "memcached-memory_status-rbv-replica.log")
         _run_case(
@@ -1092,35 +1191,28 @@ def main() -> int:
                 ),
                 _cmd_with_taskset(
                     cpus.rbv_primary,
-                    [
-                        str(bins["rbv_primary_mem"]),
-                        str(port),
-                        str(args.rbv_ngroups),
-                        str(replica_port),
-                        "127.0.0.1",
-                    ],
+                    _rbv_primary_cmd(
+                        bins["rbv_primary_mem"],
+                        port,
+                        replica_port,
+                        "--sync" if args.rbv_sync else "--async",
+                    ),
                     args.pin,
                 ),
             ],
             _client_cmd(
-                [
-                    str(client_bin) if not remote_client else str(args.remote_client_bin),
-                    args.server_ip,
-                    str(port),
-                    mem_client_log_arg("rbv"),
-                    str(args.rbv_ngroups),
-                    str(args.nclients),
-                    str(args.nsets_exp),
-                    str(args.ngets_exp),
-                    str(rbv_rps),
-                ]
+                _client_args(
+                    port,
+                    logs.client_log_arg("rbv"),
+                    args.rbv_ngroups,
+                    rbv_rps,
+                )
             ),
-            run_log("rbv"),
+            logs.run_log("rbv"),
             args.timeout_sec,
             server_start_interval_sec=2.0,
         )
-        if remote_client:
-            _remote_fetch(mem_client_log_arg("rbv"), mem_client_log("rbv"))
+        _fetch_client_log(logs, "rbv")
         move_if_exists(
             root / "memcached-memory_status-rbv-primary.log",
             mem_status_log("rbv-primary"),

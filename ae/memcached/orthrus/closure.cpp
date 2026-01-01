@@ -15,7 +15,7 @@ namespace NAMESPACE {
 using namespace ::scee;
 
 hashmap_t::entry_t::entry_t(Key key, Val val, fixed_ptr_t<entry_t> next)
-    : key(key), val_ptr(ptr_t<Val>::create(val)), next(next) {}
+    : key(key), key_pad(0), val_ptr(ptr_t<Val>::create(val)), next(next) {}
 
 void hashmap_t::entry_t::destroy() const {
     if (val_ptr != nullptr) {

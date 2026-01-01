@@ -43,6 +43,7 @@ struct hashmap_t : public scee::imm_nonunique_t {
     struct entry_t : public scee::imm_nonunique_t {
         size_t size() const { return sizeof(*this); }
         Key key;
+        uint32_t key_pad = 0;
         scee::ptr_t<Val> *val_ptr;
         scee::fixed_ptr_t<entry_t> next;
         entry_t(Key key, Val val, scee::fixed_ptr_t<entry_t> next);

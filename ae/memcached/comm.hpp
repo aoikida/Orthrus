@@ -32,8 +32,17 @@ static inline void write_all(int fd, const char *buf, size_t len) {
     size_t written = 0;
     while (written < len) {
         ssize_t ret = write(fd, buf + written, len - written);
-        assert(ret > 0);
-        written += ret;
+        if (ret > 0) {
+            written += static_cast<size_t>(ret);
+            continue;
+        }
+        if (ret == 0) continue;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            my_usleep(1);
+            continue;
+        }
+        assert(false);
     }
 }
 
@@ -41,8 +50,17 @@ static inline void write_all(int fd, std::string s) {
     size_t written = 0, len = s.size();
     while (written < len) {
         ssize_t ret = write(fd, s.data() + written, len - written);
-        assert(ret > 0);
-        written += ret;
+        if (ret > 0) {
+            written += static_cast<size_t>(ret);
+            continue;
+        }
+        if (ret == 0) continue;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            my_usleep(1);
+            continue;
+        }
+        assert(false);
     }
 }
 

@@ -12,6 +12,31 @@ from pathlib import Path
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+SEI_VARIANT_CHOICES = ["er2", "er5", "er10", "dynamicNway", "core", "dynamicCore"]
+SEI_VARIANT_ALIASES = {"default": "er2"}
+
+
+def _normalize_sei_variant(variant: str) -> str:
+    v = variant.strip()
+    return SEI_VARIANT_ALIASES.get(v, v)
+
+
+def _parse_sei_variants(s: str) -> List[str]:
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty list")
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        p = _normalize_sei_variant(p)
+        if p not in SEI_VARIANT_CHOICES:
+            raise ValueError(f"Unknown sei variant: {p}")
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
 
 def _parse_int_list(s: str) -> List[int]:
     xs: List[int] = []
@@ -20,18 +45,6 @@ def _parse_int_list(s: str) -> List[int]:
         if not part:
             continue
         xs.append(int(part))
-    if not xs:
-        raise ValueError("empty list")
-    return xs
-
-
-def _parse_str_list(s: str) -> List[str]:
-    xs: List[str] = []
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        xs.append(part)
     if not xs:
         raise ValueError("empty list")
     return xs
@@ -254,15 +267,15 @@ def _write_svg_line_chart(
 @dataclass(frozen=True)
 class RunResult:
     rps: int
-    sei_variant: str
     repeat: int
     tag: str
     throughput_json: str
     vanilla: float
-    sei: float
+    sei: Dict[str, float]
     orthrus: float
     orthrus_sync: Optional[float]
     rbv: float
+    rbv_sync: Optional[float]
 
 
 def main() -> int:
@@ -289,20 +302,29 @@ def main() -> int:
     parser.add_argument("--client-pin-cpus", default=None)
     parser.add_argument(
         "--rps",
-        default="0,1000,2000,4000,8000,12000,16000",
-        help="Comma-separated list of rps values passed to client (default: 0,1000,2000,4000,8000,12000,16000).",
+        default="0,2000,4000,8000,12000,16000",
+        help="Comma-separated list of rps values passed to client (default: 0,2000,4000,8000,12000,16000).",
     )
     parser.add_argument("--nclients", type=int, default=16)
     parser.add_argument(
+        "--read-pct",
+        type=float,
+        default=None,
+        help=(
+            "If set, configure memcached_client to be read-heavy: percentage of "
+            "GETs among (UPDATE+GET) after initial SET (example: 95 for ~95%% reads)."
+        ),
+    )
+    parser.add_argument(
         "--sei-variants",
-        default="er2,er5,er10,dynamicNway,dynamicCore",
-        help="Comma-separated SEI variants to sweep (default: er2,er5,er10,dynamicNway,dynamicCore).",
+        default="er2,er5,er10,dynamicNway,core,dynamicCore",
+        help="Comma-separated SEI variants to sweep (default: er2,er5,er10,dynamicNway,core,dynamicCore).",
     )
     parser.add_argument(
         "--orthrus-sync",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Also run Orthrus with synchronous validation (SCEE_SYNC_VALIDATE).",
+        default=True,
+        help="Also run Orthrus with synchronous validation (SCEE_SYNC_VALIDATE) (default: enabled).",
     )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--pin", action=argparse.BooleanOptionalAction, default=True)
@@ -336,6 +358,12 @@ def main() -> int:
         help="Skip runs if their throughput JSON already exists (default: enabled).",
     )
     parser.add_argument(
+        "--rbv-sync",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also run RBV with synchronous validation (rbv_sync series).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="If set, re-run even if output files already exist.",
@@ -352,11 +380,25 @@ def main() -> int:
     if args.repeats <= 0:
         raise ValueError("--repeats must be >= 1")
 
+    if args.mode == "memory":
+        raise ValueError(
+            "--mode memory is not supported by this sweep script (it aggregates throughput JSON). "
+            "Use --mode throughput or --mode all."
+        )
+
     rps_list = _parse_int_list(args.rps)
-    sei_variants = _parse_str_list(args.sei_variants)
+    sei_variants = _parse_sei_variants(args.sei_variants)
     for rps in rps_list:
         if rps < 0:
             raise ValueError("rps values must be >= 0")
+
+    if args.read_pct is not None:
+        read_pct = float(args.read_pct)
+        if read_pct <= 1.0:
+            read_pct *= 100.0
+        if not (read_pct > 0.0 and read_pct <= 100.0):
+            raise ValueError("--read-pct must be in (0,100] (or provide a ratio in (0,1]).")
+        args.read_pct = read_pct
 
     root = Path(__file__).resolve().parents[2]
     results_dir = root / "results"
@@ -369,142 +411,164 @@ def main() -> int:
     out_tag = _sanitize_tag(args.out_tag or tag_prefix)
 
     sei_series_name = {
-        "default": "sei_default",
         "er2": "sei_er2",
         "er5": "sei_er5",
         "er10": "sei_er10",
         "dynamicNway": "sei_dynamicNway_rb_er5",
+        "core": "sei_core",
         "dynamicCore": "sei_dynamicCore_rb",
     }
 
+    for variant in sei_variants:
+        if variant not in sei_series_name:
+            raise ValueError(f"Unknown sei variant: {variant}")
+
+    def _extract_sei_throughputs(data: dict) -> Dict[str, float]:
+        blob = data.get("sei")
+        if not isinstance(blob, dict):
+            raise ValueError("invalid throughput json: missing 'sei' dict")
+        # Single-variant output (legacy): {'throughput': ..., ...}
+        if "throughput" in blob:
+            if len(sei_variants) != 1:
+                raise ValueError(
+                    "existing throughput json contains only one SEI result; rerun without --resume"
+                )
+            return {sei_variants[0]: float(blob["throughput"])}
+
+        out: Dict[str, float] = {}
+        for v in sei_variants:
+            v_obj = blob.get(v)
+            if v_obj is None and v == "er2":
+                v_obj = blob.get("default")
+            if not isinstance(v_obj, dict) or "throughput" not in v_obj:
+                raise ValueError(f"missing SEI variant result in json: {v}")
+            out[v] = float(v_obj["throughput"])
+        return out
+
+    def _run_result_from_data(*, data: dict, rps: int, repeat: int, tag: str, out_json: Path) -> RunResult:
+        sei_tp = _extract_sei_throughputs(data)
+        return RunResult(
+            rps=rps,
+            repeat=repeat,
+            tag=tag,
+            throughput_json=str(out_json.relative_to(root)),
+            vanilla=float(data["vanilla"]["throughput"]),
+            sei=sei_tp,
+            orthrus=float(data["orthrus"]["throughput"]),
+            orthrus_sync=(
+                float(data["orthrus_sync"]["throughput"]) if "orthrus_sync" in data else None
+            ),
+            rbv=float(data["rbv"]["throughput"]),
+            rbv_sync=(float(data["rbv_sync"]["throughput"]) if "rbv_sync" in data else None),
+        )
+
+    def _try_load_existing(*, out_json: Path, rps: int, repeat: int, tag: str) -> Optional[RunResult]:
+        try:
+            with open(out_json, encoding="utf8") as f:
+                data = json.load(f)
+            rr = _run_result_from_data(data=data, rps=rps, repeat=repeat, tag=tag, out_json=out_json)
+        except Exception:
+            return None
+        if args.orthrus_sync and rr.orthrus_sync is None:
+            return None
+        if args.rbv_sync and rr.rbv_sync is None:
+            return None
+        return rr
+
     runs: List[RunResult] = []
-    total = len(rps_list) * len(sei_variants) * args.repeats
+    total = len(rps_list) * args.repeats
     done = 0
     for rps in rps_list:
-        for variant in sei_variants:
-            if variant not in sei_series_name:
-                raise ValueError(f"Unknown sei variant: {variant}")
-            for r in range(1, args.repeats + 1):
-                tag = _sanitize_tag(f"{tag_prefix}.rps{rps}.sei{variant}.r{r}")
-                out_json = results_dir / f"memcached-throughput-report.{tag}.txt.json"
-                if not args.force and args.resume and out_json.exists():
-                    with open(out_json, encoding="utf8") as f:
-                        data = json.load(f)
-                    if not (args.orthrus_sync and "orthrus_sync" not in data):
-                        if args.dry_run:
-                            print(
-                                f"[dry-run] would load existing {out_json}",
-                                file=sys.stderr,
-                            )
-                        else:
-                            runs.append(
-                                RunResult(
-                                    rps=rps,
-                                    sei_variant=variant,
-                                    repeat=r,
-                                    tag=tag,
-                                    throughput_json=str(out_json.relative_to(root)),
-                                    vanilla=float(data["vanilla"]["throughput"]),
-                                    sei=float(data["sei"]["throughput"]),
-                                    orthrus=float(data["orthrus"]["throughput"]),
-                                    orthrus_sync=(
-                                        float(data["orthrus_sync"]["throughput"])
-                                        if "orthrus_sync" in data
-                                        else None
-                                    ),
-                                    rbv=float(data["rbv"]["throughput"]),
-                                )
-                            )
-                        done += 1
-                        continue
+        for r in range(1, args.repeats + 1):
+            tag = _sanitize_tag(f"{tag_prefix}.rps{rps}.r{r}")
+            out_json = results_dir / f"memcached-throughput-report.{tag}.txt.json"
 
-                cmd: List[str] = [
-                    sys.executable,
-                    str(run_compare),
-                    "--build-dir",
-                    str(args.build_dir),
-                    "--preset",
-                    args.preset,
-                    "--server-ip",
-                    args.server_ip,
-                    "--port-start",
-                    str(args.port_start),
-                    "--port-end",
-                    str(args.port_end),
-                    "--sei-variant",
-                    variant,
-                    "--nclients",
-                    str(args.nclients),
-                    "--rps",
-                    str(rps),
-                    "--mode",
-                    args.mode,
-                    "--tag",
-                    tag,
-                ]
-                if not args.pin:
-                    cmd.append("--no-pin")
-                if args.ngroups is not None:
-                    cmd += ["--ngroups", str(args.ngroups)]
-                if args.vanilla_ngroups is not None:
-                    cmd += ["--vanilla-ngroups", str(args.vanilla_ngroups)]
-                if args.sei_ngroups is not None:
-                    cmd += ["--sei-ngroups", str(args.sei_ngroups)]
-                if args.orthrus_ngroups is not None:
-                    cmd += ["--orthrus-ngroups", str(args.orthrus_ngroups)]
-                if args.rbv_ngroups is not None:
-                    cmd += ["--rbv-ngroups", str(args.rbv_ngroups)]
-                if args.orthrus_sync:
-                    cmd.append("--orthrus-sync")
-                if args.nsets_exp is not None:
-                    cmd += ["--nsets-exp", str(args.nsets_exp)]
-                if args.ngets_exp is not None:
-                    cmd += ["--ngets-exp", str(args.ngets_exp)]
-                if args.timeout_sec is not None:
-                    cmd += ["--timeout-sec", str(args.timeout_sec)]
-                if args.client_ssh is not None:
-                    cmd += ["--client-ssh", args.client_ssh]
-                    if args.client_workdir is not None:
-                        cmd += ["--client-workdir", args.client_workdir]
-                    if args.remote_client_bin is not None:
-                        cmd += ["--remote-client-bin", args.remote_client_bin]
-                    if args.client_temp_dir is not None:
-                        cmd += ["--client-temp-dir", args.client_temp_dir]
-                    if args.client_pin_cpus is not None:
-                        cmd += ["--client-pin-cpus", args.client_pin_cpus]
-
-                done += 1
-                print(
-                    f"[{done}/{total}] rps={rps} nclients={args.nclients} sei_variant={variant} r={r}",
-                    file=sys.stderr,
-                )
-                print("+", " ".join(cmd), file=sys.stderr)
-                if args.dry_run:
+            if not args.force and args.resume and out_json.exists():
+                rr = _try_load_existing(out_json=out_json, rps=rps, repeat=r, tag=tag)
+                if rr is not None:
+                    if args.dry_run:
+                        print(
+                            f"[dry-run] would load existing {out_json}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        runs.append(rr)
+                    done += 1
                     continue
-                subprocess.run(cmd, cwd=str(root), check=True)
 
-                if not out_json.exists():
-                    raise FileNotFoundError(str(out_json))
-                with open(out_json, encoding="utf8") as f:
-                    data = json.load(f)
-                runs.append(
-                    RunResult(
-                        rps=rps,
-                        sei_variant=variant,
-                        repeat=r,
-                        tag=tag,
-                        throughput_json=str(out_json.relative_to(root)),
-                        vanilla=float(data["vanilla"]["throughput"]),
-                        sei=float(data["sei"]["throughput"]),
-                        orthrus=float(data["orthrus"]["throughput"]),
-                        orthrus_sync=(
-                            float(data["orthrus_sync"]["throughput"])
-                            if "orthrus_sync" in data
-                            else None
-                        ),
-                        rbv=float(data["rbv"]["throughput"]),
-                    )
-                )
+            cmd: List[str] = [
+                sys.executable,
+                str(run_compare),
+                "--build-dir",
+                str(args.build_dir),
+                "--preset",
+                args.preset,
+                "--server-ip",
+                args.server_ip,
+                "--port-start",
+                str(args.port_start),
+                "--port-end",
+                str(args.port_end),
+                "--sei-variants",
+                ",".join(sei_variants),
+                "--nclients",
+                str(args.nclients),
+                "--rps",
+                str(rps),
+                "--mode",
+                args.mode,
+                "--tag",
+                tag,
+                "--orthrus-sync" if args.orthrus_sync else "--no-orthrus-sync",
+                "--rbv-sync" if args.rbv_sync else "--no-rbv-sync",
+            ]
+            if not args.pin:
+                cmd.append("--no-pin")
+            if args.ngroups is not None:
+                cmd += ["--ngroups", str(args.ngroups)]
+            if args.vanilla_ngroups is not None:
+                cmd += ["--vanilla-ngroups", str(args.vanilla_ngroups)]
+            if args.sei_ngroups is not None:
+                cmd += ["--sei-ngroups", str(args.sei_ngroups)]
+            if args.orthrus_ngroups is not None:
+                cmd += ["--orthrus-ngroups", str(args.orthrus_ngroups)]
+            if args.rbv_ngroups is not None:
+                cmd += ["--rbv-ngroups", str(args.rbv_ngroups)]
+            if args.nsets_exp is not None:
+                cmd += ["--nsets-exp", str(args.nsets_exp)]
+            if args.ngets_exp is not None:
+                cmd += ["--ngets-exp", str(args.ngets_exp)]
+            if args.read_pct is not None:
+                cmd += ["--read-pct", str(args.read_pct)]
+            if args.timeout_sec is not None:
+                cmd += ["--timeout-sec", str(args.timeout_sec)]
+            if args.client_ssh is not None:
+                cmd += ["--client-ssh", args.client_ssh]
+                if args.client_workdir is not None:
+                    cmd += ["--client-workdir", args.client_workdir]
+                if args.remote_client_bin is not None:
+                    cmd += ["--remote-client-bin", args.remote_client_bin]
+                if args.client_temp_dir is not None:
+                    cmd += ["--client-temp-dir", args.client_temp_dir]
+                if args.client_pin_cpus is not None:
+                    cmd += ["--client-pin-cpus", args.client_pin_cpus]
+
+            done += 1
+            print(
+                f"[{done}/{total}] rps={rps} nclients={args.nclients} "
+                f"sei_variants={','.join(sei_variants)} r={r}",
+                file=sys.stderr,
+            )
+            print("+", " ".join(cmd), file=sys.stderr)
+            if args.dry_run:
+                continue
+            subprocess.run(cmd, cwd=str(root), check=True)
+
+            if not out_json.exists():
+                raise FileNotFoundError(str(out_json))
+            with open(out_json, encoding="utf8") as f:
+                data = json.load(f)
+            runs.append(_run_result_from_data(data=data, rps=rps, repeat=r, tag=tag, out_json=out_json))
 
     if args.dry_run:
         return 0
@@ -533,6 +597,7 @@ def main() -> int:
         "orthrus": [],
         **({"orthrus_sync": []} if args.orthrus_sync else {}),
         "rbv": [],
+        **({"rbv_sync": []} if args.rbv_sync else {}),
     }
     for rps in rps_list:
         vals = by_rps.get(rps, [])
@@ -546,13 +611,20 @@ def main() -> int:
             sync_vals = pick_optional(vals, "orthrus_sync")
             base_series["orthrus_sync"].append(_median(sync_vals) if sync_vals else None)
         base_series["rbv"].append(_median(pick(vals, "rbv")))
+        if args.rbv_sync:
+            rbv_sync_vals = pick_optional(vals, "rbv_sync")
+            base_series["rbv_sync"].append(_median(rbv_sync_vals) if rbv_sync_vals else None)
 
     sei_series: Dict[str, List[Optional[float]]] = {}
     for variant in sei_variants:
         name = sei_series_name[variant]
         ys: List[Optional[float]] = []
         for rps in rps_list:
-            vals = [rr.sei for rr in by_rps.get(rps, []) if rr.sei_variant == variant]
+            vals = [
+                rr.sei[variant]
+                for rr in by_rps.get(rps, [])
+                if isinstance(rr.sei, dict) and variant in rr.sei
+            ]
             ys.append(_median(vals) if vals else None)
         sei_series[name] = ys
 
@@ -562,7 +634,7 @@ def main() -> int:
     out_csv = results_dir / f"memcached-throughput-vs-rps.{out_tag}.csv"
     out_svg = results_dir / f"memcached-throughput-vs-rps.{out_tag}.svg"
 
-    orthus_sha = _git_sha(root)
+    orthrus_sha = _git_sha(root)
     libsei_sha = _git_sha((root / ".." / "libsei-gcc").resolve())
 
     out_json.write_text(
@@ -570,9 +642,11 @@ def main() -> int:
             {
                 "preset": args.preset,
                 "nclients": args.nclients,
+                "read_pct": args.read_pct,
                 "rps": rps_list,
                 "sei_variants": sei_variants,
                 "orthrus_sync": args.orthrus_sync,
+                "rbv_sync": args.rbv_sync,
                 "repeats": args.repeats,
                 "mode": args.mode,
                 "build_dir": args.build_dir,
@@ -589,7 +663,7 @@ def main() -> int:
                     "host": platform.node(),
                     "uname": " ".join(platform.uname()),
                     "python": sys.version,
-                    "sha": {"Orthrus": orthus_sha, "libsei-gcc": libsei_sha},
+                    "sha": {"Orthrus": orthrus_sha, "libsei-gcc": libsei_sha},
                 },
                 "note": {
                     "rps_semantics": "rps is passed to the client and applies to UPDATE/GET only; internally the client computes rps_per_thread=rps*ngroups/nclients",
@@ -609,6 +683,8 @@ def main() -> int:
     if args.orthrus_sync:
         series_names.append("orthrus_sync")
     series_names.append("rbv")
+    if args.rbv_sync:
+        series_names.append("rbv_sync")
     with open(out_csv, "w", encoding="utf8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["rps", *series_names])

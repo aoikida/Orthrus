@@ -19,6 +19,11 @@ set(LIBSEI_BUILD_DYNAMIC_CORE ${LIBSEI_GCC_ROOT}/build_dyn_core_rb)
 set(LIBSEI_LIB_DYNAMIC_CORE ${LIBSEI_BUILD_DYNAMIC_CORE}/libsei.a)
 set(LIBCRC_LIB_DYNAMIC_CORE ${LIBSEI_BUILD_DYNAMIC_CORE}/libcrc.a)
 
+# Static core redundancy build.
+set(LIBSEI_BUILD_CORE ${LIBSEI_GCC_ROOT}/build_core1_only)
+set(LIBSEI_LIB_CORE ${LIBSEI_BUILD_CORE}/libsei.a)
+set(LIBCRC_LIB_CORE ${LIBSEI_BUILD_CORE}/libcrc.a)
+
 # Static N-way SEI builds (no rollback, no core migration).
 set(LIBSEI_BUILD_ER2_NOMIG ${LIBSEI_GCC_ROOT}/build_er2_nomig)
 set(LIBSEI_LIB_ER2_NOMIG ${LIBSEI_BUILD_ER2_NOMIG}/libsei.a)
@@ -71,6 +76,17 @@ target_include_directories(memcached_sei_dynamic_core_mem PRIVATE ${LIBSEI_INCLU
 target_compile_options(memcached_sei_dynamic_core_mem PRIVATE -fgnu-tm -fno-omit-frame-pointer -fno-builtin)
 target_link_libraries(memcached_sei_dynamic_core_mem PRIVATE Threads::Threads sei_itm_shim ${LIBSEI_LIB_DYNAMIC_CORE} ${LIBCRC_LIB_DYNAMIC_CORE} dl m profile_mem)
 target_compile_definitions(memcached_sei_dynamic_core_mem PRIVATE PROFILE_MEM)
+
+add_executable(memcached_sei_core sei/server.cpp sei/hashmap.cpp sei/pthread_tm_wrappers.cpp)
+target_include_directories(memcached_sei_core PRIVATE ${LIBSEI_INCLUDE})
+target_compile_options(memcached_sei_core PRIVATE -fgnu-tm -fno-omit-frame-pointer -fno-builtin)
+target_link_libraries(memcached_sei_core PRIVATE Threads::Threads sei_itm_shim ${LIBSEI_LIB_CORE} ${LIBCRC_LIB_CORE} dl m)
+
+add_executable(memcached_sei_core_mem sei/server.cpp sei/hashmap.cpp sei/pthread_tm_wrappers.cpp)
+target_include_directories(memcached_sei_core_mem PRIVATE ${LIBSEI_INCLUDE})
+target_compile_options(memcached_sei_core_mem PRIVATE -fgnu-tm -fno-omit-frame-pointer -fno-builtin)
+target_link_libraries(memcached_sei_core_mem PRIVATE Threads::Threads sei_itm_shim ${LIBSEI_LIB_CORE} ${LIBCRC_LIB_CORE} dl m profile_mem)
+target_compile_definitions(memcached_sei_core_mem PRIVATE PROFILE_MEM)
 
 add_executable(memcached_sei_er2 sei/server.cpp sei/hashmap.cpp sei/pthread_tm_wrappers.cpp)
 target_include_directories(memcached_sei_er2 PRIVATE ${LIBSEI_INCLUDE})

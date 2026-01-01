@@ -12,7 +12,7 @@ def parse(file):
     with open(file, encoding="utf8") as f:
         data = f.read().strip()
 
-    def _worker(xs):
+    def _worker(cfg, xs):
         def __worker(pat, line):
             if match := pat.match(line):
                 return {
@@ -29,6 +29,7 @@ def parse(file):
         d_get = __worker(pat_get, xs[2])
 
         ret = {
+            # Backward-compatible default: simple (unweighted) average.
             "throughput": (d_update["throughput"] + d_get["throughput"]) / 2,
             "duration": None,
             "latency_req": {
@@ -37,27 +38,74 @@ def parse(file):
                 "p95": (d_update["p95"] + d_get["p95"]) / 2 / 1000,
                 "p99": (d_update["p99"] + d_get["p99"]) / 2 / 1000,
             },
+            "throughput_set": d_set["throughput"],
+            "throughput_update": d_update["throughput"],
+            "throughput_get": d_get["throughput"],
         }
+
+        # When read_pct is explicitly enabled on the client (read_pct>0),
+        # compute a weighted overall throughput based on operation counts.
+        if cfg:
+            try:
+                read_pct = float(cfg.get("read_pct", "-1"))
+            except Exception:
+                read_pct = -1.0
+
+            # New client logs always include read_pct; disabled is encoded as <0.
+            if read_pct > 0.0:
+                try:
+                    nclients = int(cfg["nclients"])
+                    ngets_per_thread = int(cfg["ngets"])
+                    ngets_total = nclients * ngets_per_thread
+                    nupdates_total = int(cfg.get("nupdates") or cfg.get("nsets") or "0")
+                except Exception:
+                    ngets_total = 0
+                    nupdates_total = 0
+
+                if ngets_total > 0 and nupdates_total > 0:
+                    t_update = nupdates_total / d_update["throughput"]
+                    t_get = ngets_total / d_get["throughput"]
+                    ret["throughput"] = (nupdates_total + ngets_total) / (t_update + t_get)
+
+                # Surface workload parameters in parsed output (useful for sweeps).
+                ret["read_pct"] = read_pct
+                if "nupdates" in cfg:
+                    ret["nupdates"] = int(cfg["nupdates"])
         return ret
 
     lines = [line.strip() for line in data.strip().splitlines() if line.strip()]
 
+    def _parse_cfg(line):
+        if not line:
+            return {}
+        cfg = {}
+        # Example:
+        #   client setting ngroups=3, nclients=32, nsets=..., nupdates=..., ngets=..., read_pct=95.000, rps=0
+        for tok in line.replace(",", "").split():
+            if "=" not in tok:
+                continue
+            k, v = tok.split("=", 1)
+            cfg[k] = v
+        return cfg
+
     blocks = []
     cur = None
+    cur_cfg = None
     for line in lines:
         if line.startswith("client setting"):
             if cur is not None:
-                blocks.append(cur)
+                blocks.append((cur_cfg, cur))
+            cur_cfg = _parse_cfg(line)
             cur = []
             continue
         if cur is None:
             continue
         cur.append(line)
     if cur is not None:
-        blocks.append(cur)
+        blocks.append((cur_cfg, cur))
 
     results = []
-    for block in blocks:
+    for cfg, block in blocks:
         # Prefer explicit task lines if present (more robust than fixed indices).
         tasks = {}
         for line in block:
@@ -79,5 +127,5 @@ def parse(file):
                 raise Exception("invalid data: missing SET/UPDATE/GET lines")
             xs = block[:3]
 
-        results.append(_worker(xs))
+        results.append(_worker(cfg, xs))
     return results

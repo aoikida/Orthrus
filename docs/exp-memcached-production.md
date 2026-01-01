@@ -53,16 +53,19 @@ Orthrus の memcached(SEI) は `../libsei-gcc` を参照します（`ae/memcache
 Orthrus の memcached(SEI) は、libsei-gcc の **複数 build ディレクトリ**をリンクします。
 同じ build dir を別フラグで再利用するとオブジェクトが混ざる可能性があるため、各 build dir は固定用途にし、作り直すときは `clean` を入れてください。
 
-### 対応表（Orthrus の `--sei-variant` と libsei-gcc ビルド）
+### 対応表（Orthrus の `--sei-variant` / `--sei-variants` と libsei-gcc ビルド）
 
 | `--sei-variant` | Orthrus が参照する build dir | libsei-gcc の Make 変数（例） |
 |---|---|---|
-| `default` | `build` | （デフォルト: `EXECUTION_REDUNDANCY=2` 相当） |
-| `er2` | `build_er2_nomig` | `EXECUTION_REDUNDANCY=2`（ROLLBACK 無し） |
-| `er5` | `build_er5_nomig` | `EXECUTION_REDUNDANCY=5`（ROLLBACK 無し） |
-| `er10` | `build_er10_nomig` | `EXECUTION_REDUNDANCY=10`（ROLLBACK 無し） |
+| `er2` | `build_er2_nomig` | `EXECUTION_REDUNDANCY=2` |
+| `er5` | `build_er5_nomig` | `EXECUTION_REDUNDANCY=5` |
+| `er10` | `build_er10_nomig` | `EXECUTION_REDUNDANCY=10` |
 | `dynamicNway` | `build_dyn_nway_er5_rb` | `ROLLBACK=1 EXECUTION_REDUNDANCY=5` |
-| `dynamicCore` | `build_dyn_core_rb` | `ROLLBACK=1` |
+| `core` | `build_core1_only` | `ROLLBACK=1 EXECUTION_CORE_REDUNDANCY=1` |
+| `dynamicCore` | `build_dyn_core_rb` | `ROLLBACK=1 EXECUTION_REDUNDANCY=2` |
+
+補足:
+- 複数の SEI をまとめて回したい場合は `--sei-variants er2,er5,...` を使います（スループット比較のときのみ対応）。
 
 ### まとめてビルドする例（SUT 側で実行）
 
@@ -72,14 +75,17 @@ cd ../libsei-gcc
 # default
 make BUILD=build clean all
 
-# static N-way (no rollback)
+# static N-way (no rollback, no core migration)
 EXECUTION_REDUNDANCY=2  make BUILD=build_er2_nomig  clean all
 EXECUTION_REDUNDANCY=5  make BUILD=build_er5_nomig  clean all
 EXECUTION_REDUNDANCY=10 make BUILD=build_er10_nomig clean all
 
+# core redundancy (rollback enabled)
+ROLLBACK=1 EXECUTION_CORE_REDUNDANCY=1 make BUILD=build_core1_only clean all
+
 # dynamic variants (rollback enabled)
 ROLLBACK=1 EXECUTION_REDUNDANCY=5 make BUILD=build_dyn_nway_er5_rb clean all
-ROLLBACK=1 make BUILD=build_dyn_core_rb clean all
+ROLLBACK=1 EXECUTION_REDUNDANCY=2 make BUILD=build_dyn_core_rb clean all
 ```
 
 補足:
@@ -114,6 +120,7 @@ build/ae/memcached/
   memcached_sei_er5
   memcached_sei_er10
   memcached_sei_dynamic_nway
+  memcached_sei_core
   memcached_sei_dynamic_core
   memcached_client
 ```
@@ -164,11 +171,13 @@ ssh user@loadhost "chmod +x /tmp/orthrus-memcached/memcached_client"
   - RBV: `server4` を primary/replica に分割して **合計4コア**（例: 2+2）
 - 実際の割当は `run-compare.py` 実行時に `CPU layout: server4=...` と stderr に出るので、そこで確認できます。
 
-どの CPU コア（番号）を `server4` に使うかは、`run-compare.py` 自身の CPU アフィニティ（`os.sched_getaffinity(0)`）に依存します。固定したい場合は、実験を起動する前に `taskset` / cpuset で Python のアフィニティを制限してください（例: `taskset -c 4-47 python3 scripts/memcached/run-sweep-rps.py --preset fair4c ...`）。
+どの CPU コア（番号）を `server4` に使うかは、`run-compare.py` 自身の CPU アフィニティ（`os.sched_getaffinity(0)`）に依存します。固定したい場合は、実験を起動する前に `taskset` / cpuset で Python のアフィニティを制限してください（例: `taskset -c 4-47 python3 scripts/memcached/run-sweep-rps-per-thread.py --preset fair4c ...`）。
 
 別ホスト負荷（`--client-ssh`）時のクライアント側 pin は、必要なら `--client-pin-cpus` で明示します。
 
 ### 7.1 単発の比較（throughput）
+
+注意: `run-compare.py` は `--rbv-sync` がデフォルト有効です。不要なら `--no-rbv-sync` を指定してください。
 
 ```bash
 python3 scripts/memcached/run-compare.py \
@@ -177,33 +186,62 @@ python3 scripts/memcached/run-compare.py \
   --server-ip <SUT_IPV4> \
   --port-start 20000 --port-end 21000 \
   --sei-variant er5 \
+  --read-pct 95 \
   --client-ssh user@loadhost \
   --remote-client-bin /tmp/orthrus-memcached/memcached_client \
   --client-pin-cpus 0-7 \
   --tag prod.throughput.er5
 ```
 
-### 7.2 RPS sweep（おすすめ）
+### 7.2 rps-per-thread sweep（おすすめ）
+
+`--preset fair4c` では variant ごとに `ngroups` が異なるため、`--rps`（per-group）だと **variant 間で総負荷が揃いません**。このドキュメントでは **`--rps-per-thread` を使って負荷を揃える**ことを推奨します。
+
+注意: `run-sweep-rps-per-thread.py` は `--orthrus-sync` と `--rbv-sync` がデフォルト有効です。不要なら `--no-orthrus-sync` / `--no-rbv-sync` を指定してください。
+
+メモ:
+- データサイズは固定長です（現在: key=4B, value=8B。変更する場合は `ae/memcached/common.hpp` と各 variant の `hashmap.hpp/common.hpp` を更新して再ビルド）。
+- `--sei-variants` を指定した場合でも、各 sweep 点で `vanilla / Orthrus / Orthrus(sync) / RBV(async)` は **1 回だけ**実行し、SEI だけを variants 分だけ連続実行します（ベース系列を variant ごとに繰り返さないため、実験回数を減らせます）。RBV(sync) もデフォルトで追加で **1 回**実行します（不要なら `--no-rbv-sync`）。
+- GET-heavy にしたい場合は `--read-pct 95` のように指定します（初期 `SET` フェーズの後、`UPDATE+GET` のうち `GET` が約 95% になるようにクライアントが `UPDATE` 回数を自動調整します）。
+- `--rbv-sync` が有効（デフォルト）だと、各 sweep 点で `rbv=async` に加えて `rbv_sync=sync` も実行します（不要なら `--no-rbv-sync`）。
+
+まず `rps=0`（rate limit 無し相当）で各 variant の最大スループットを見たい場合は、次を使います（出力: `results/memcached-max-throughput.<out-tag>.{txt,csv,json}`）:
 
 ```bash
-python3 scripts/memcached/run-sweep-rps.py \
+python3 scripts/memcached/run-max-throughput.py \
   --preset fair4c \
   --server-ip <SUT_IPV4> \
   --port-start 20000 --port-end 21000 \
+  --read-pct 95 \
   --client-ssh user@loadhost \
   --remote-client-bin /tmp/orthrus-memcached/memcached_client \
   --client-pin-cpus 0-7 \
-  --sei-variants er2,er5,er10,dynamicNway,dynamicCore \
+  --sei-variants er2,er5,er10,dynamicNway,core,dynamicCore \
   --nclients 16 \
-  --rps 0,2000,4000,8000,12000 \
   --repeats 3 \
-  --tag-prefix prod_sweep_rps.2025XXXX
+  --tag-prefix prod_max_tp.2025XXXX
+```
+
+```bash
+python3 scripts/memcached/run-sweep-rps-per-thread.py \
+  --preset fair4c \
+  --server-ip <SUT_IPV4> \
+  --port-start 20000 --port-end 21000 \
+  --read-pct 95 \
+  --client-ssh user@loadhost \
+  --remote-client-bin /tmp/orthrus-memcached/memcached_client \
+  --client-pin-cpus 0-7 \
+  --sei-variants er2,er5,er10,dynamicNway,core,dynamicCore \
+  --nclients 16 \
+  --rps-per-thread 0,1000,2000,4000,6000,8000 \
+  --repeats 1 \
+  --tag-prefix prod_sweep_rpspt.2025XXXX
 ```
 
 まずは `--dry-run` でコマンドを確認するのがおすすめです:
 
 ```bash
-python3 scripts/memcached/run-sweep-rps.py --dry-run ...
+python3 scripts/memcached/run-sweep-rps-per-thread.py --dry-run ...
 ```
 
 ---
@@ -211,7 +249,9 @@ python3 scripts/memcached/run-sweep-rps.py --dry-run ...
 ## 8. 出力（results/）
 
 - 単発比較: `results/memcached-throughput-report.<tag>.txt` と `results/memcached-throughput-report.<tag>.txt.json`
-- sweep 集計: `results/memcached-throughput-vs-rps.<out-tag>.{json,csv,svg}`
+- sweep 集計: `results/memcached-throughput-vs-rps-per-thread.<out-tag>.{json,csv,svg}`
+- `--sei-variants`（複数）を使った場合、`memcached-throughput-report.<tag>.txt.json` の `sei` は `{variant -> metrics}` の辞書になります（単一の場合は従来通り `sei: {throughput: ...}`）。
+- `--rbv-sync` が有効（デフォルト）だと、`memcached-throughput-report.<tag>.txt.json` に `rbv_sync` が追加され、sweep の `{json,csv,svg}` にも `rbv_sync` 系列が追加されます（不要なら `--no-rbv-sync`）。
 
 ---
 

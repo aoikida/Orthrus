@@ -14,5 +14,5 @@ static const char *kRetVals[] = {"ERROR\r\n",  "DELETED\r\n", "NOT_FOUND\r\n",
                                  "VALUE "};
 static const char kCrlf[] = "\r\n";
 
-constexpr size_t KEY_LEN = 64;
-constexpr size_t VAL_LEN = 256;
+constexpr size_t KEY_LEN = 4;
+constexpr size_t VAL_LEN = 8;

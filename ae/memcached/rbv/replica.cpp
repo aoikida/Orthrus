@@ -9,6 +9,7 @@
 #include <cassert>
 #include <memory>
 #include <regex>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -34,14 +35,35 @@ struct fd_worker {
     size_t len;
     fd_reader reader;
     long long t_start;
+    bool mode_set;
+    bool sync_mode;
 
     fd_worker(int _fd) : reader(_fd) {
         wt_buffer = (char *)malloc(kBufferSize);
         len = 0;
         t_start = 0;
+        mode_set = false;
+        sync_mode = false;
     }
     bool run() {
         while ((len = reader.read_packet('\n'))) {
+            if (!mode_set) {
+                std::string_view line(reader.packet, len);
+                if (!line.empty() && line.back() == '\n') line.remove_suffix(1);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                if (line == "mode sync") {
+                    sync_mode = true;
+                    mode_set = true;
+                    continue;
+                }
+                if (line == "mode async") {
+                    sync_mode = false;
+                    mode_set = true;
+                    continue;
+                }
+                // Backward compatibility: old primaries don't send "mode ...".
+                mode_set = true;
+            }
             if (!memcmp(reader.packet, "quit", 4)) {
                 write_all(reader.fd, "ACK\n");
                 return true;
@@ -94,6 +116,9 @@ struct fd_worker {
             profile::record_validation_cpu_time(0, 1);
 #endif
             t_start = 0;
+            if (sync_mode) {
+                write_all(reader.fd, "ACK\n");
+            }
         }
         return false;
     }

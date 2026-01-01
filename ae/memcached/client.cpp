@@ -7,10 +7,12 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <cstring>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <thread>
 #include <vector>
@@ -65,26 +67,59 @@ evaluation::evaluation(FILE *log, uint64_t num_ops, int n_threads,
 }
 
 evaluation::~evaluation() {
-    uint64_t n_phases = std::min(num_ops, 8LU);
-    uint64_t l = num_ops / n_phases, r = num_ops * (n_phases - 1) / n_phases;
+    if (num_ops == 0) return;
+
+    uint64_t n_phases = std::min<uint64_t>(num_ops, 8LU);
+    uint64_t l = 0, r = num_ops;
+    if (n_phases > 1) {
+        l = num_ops / n_phases;
+        r = num_ops * (n_phases - 1) / n_phases;
+    }
+    if (r < l) std::swap(l, r);
+    if (r <= l) {
+        l = 0;
+        r = num_ops;
+    }
+    const uint64_t span = r - l;
+    if (span == 0) {
+        l = 0;
+        r = num_ops;
+    }
+
     std::sort(latency.begin() + l, latency.begin() + r);
-    uint64_t p90 = nanosecond(0, latency[l + uint64_t((r - l) * .9)]);
-    uint64_t p95 = nanosecond(0, latency[l + uint64_t((r - l) * .95)]);
-    uint64_t p99 = nanosecond(0, latency[l + uint64_t((r - l) * .99)]);
-    uint64_t avg = nanosecond(0, std::accumulate(latency.begin() + l,
-                                                 latency.begin() + r, 0ULL)) /
-                   (r - l);
+    const uint64_t n = r - l;
+    const uint64_t p90 = nanosecond(0, latency[l + uint64_t(n * .9)]);
+    const uint64_t p95 = nanosecond(0, latency[l + uint64_t(n * .95)]);
+    const uint64_t p99 = nanosecond(0, latency[l + uint64_t(n * .99)]);
+    const uint64_t avg =
+        nanosecond(0, std::accumulate(latency.begin() + l, latency.begin() + r,
+                                      0ULL)) /
+        (n ? n : 1);
     auto period = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - records[0].first);
-    fprintf(stderr, "Finished task %s. Time: %ld us; Throughput: %f/s.\n",
-            task.c_str(), period.count(), num_ops * 1e6 / period.count());
-    l = ((uint64_t)records.size() - 1) / n_phases,
-    r = ((uint64_t)records.size() - 1) * (n_phases - 1) / n_phases;
-    period = std::chrono::duration_cast<std::chrono::microseconds>(
-        records[r + 1].first - records[l].first);
-    // NOTE: Use put as the estimated throughput
-    uint64_t put = (records[r + 1].second - records[l].second) * 1000000LL /
-                   period.count();
+    const long long total_us = std::max<long long>(period.count(), 1);
+    fprintf(stderr, "Finished task %s. Time: %lld us; Throughput: %f/s.\n",
+            task.c_str(), total_us, num_ops * 1e6 / total_us);
+    uint64_t put = static_cast<uint64_t>(num_ops) * 1000000ULL /
+                   static_cast<uint64_t>(total_us);
+    if (records.size() >= 2) {
+        const uint64_t last = records.size() - 1;
+        const uint64_t max_r = last - 1;  // we use (r + 1) below
+        uint64_t lrec = 0, rrec = max_r;
+        if (n_phases > 1 && max_r > 0) {
+            lrec = max_r / n_phases;
+            rrec = max_r * (n_phases - 1) / n_phases;
+        }
+        if (rrec < lrec) std::swap(lrec, rrec);
+        if (lrec > max_r) lrec = max_r;
+        if (rrec > max_r) rrec = max_r;
+        period = std::chrono::duration_cast<std::chrono::microseconds>(
+            records[rrec + 1].first - records[lrec].first);
+        const long long window_us = std::max<long long>(period.count(), 1);
+        // NOTE: Use put as the estimated throughput
+        put = (records[rrec + 1].second - records[lrec].second) * 1000000LL /
+              window_us;
+    }
     fprintf(stderr, "Estimated (operation) throughput: %lu/s\n", put);
     fprintf(log, "%s put %lu avg %lu p90 %lu p95 %lu p99 %lu\n", task.c_str(),
             put, avg, p90, p95, p99);
@@ -111,6 +146,8 @@ void evaluation::report() {
 
 static std::string ip, output_file;
 static uint32_t port, ngroups, nsets, ngets, nclients, rps;
+static double read_pct = -1.0;
+static uint64_t nupdates = 0;
 
 static inline void write_all(int fd, const char *buf, size_t len) {
     size_t written = 0;
@@ -200,6 +237,27 @@ inline void random_string(char *data, uint32_t len, std::mt19937 *rng) {
     }
 }
 
+static constexpr char kKeyAlphabet[] =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static constexpr uint64_t kKeyAlphabetSize = sizeof(kKeyAlphabet) - 1;
+static constexpr uint64_t kKeyPermuteMul = 11400714819323198485ULL;
+
+static inline uint64_t keyspace() {
+    uint64_t space = 1;
+    for (size_t i = 0; i < KEY_LEN; ++i) {
+        space *= kKeyAlphabetSize;
+    }
+    return space;
+}
+
+static inline void encode_key(char *dst, uint64_t idx, uint64_t space) {
+    uint64_t v = (idx * kKeyPermuteMul) % space;
+    for (size_t i = 0; i < KEY_LEN; ++i) {
+        dst[KEY_LEN - 1 - i] = kKeyAlphabet[v % kKeyAlphabetSize];
+        v /= kKeyAlphabetSize;
+    }
+}
+
 const double kZipfParamS = 1.16;  // to match zipfian distribution
 const uint32_t kNumPrints = 32;
 const uint32_t kMaxNumThreads = 128;
@@ -273,15 +331,25 @@ int connect_server(int group_id) {
 
 void prepare_key() {
     fprintf(stderr, "Prepare keys...\n");
+    const uint64_t space = keyspace();
+    if (uint64_t(kNumKVPairs) > space) {
+        fprintf(
+            stderr,
+            "Too many keys (%u) for KEY_LEN=%zu (max=%lu). Reduce nsets or increase KEY_LEN.\n",
+            kNumKVPairs,
+            size_t(KEY_LEN),
+            space);
+        exit(1);
+    }
     std::vector<std::thread> threads;
     auto start = microtime();
     for (uint32_t i = 0; i < kNumThreads; ++i) {
-        threads.emplace_back([i]() {
+        threads.emplace_back([i, space]() {
             uint32_t start_idx = i * kNumKVPairs / kNumThreads;
             uint32_t end_idx =
                 std::min((i + 1) * kNumKVPairs / kNumThreads, kNumKVPairs);
             for (uint32_t k = start_idx; k < end_idx; ++k) {
-                random_string(all_keys[k].data, KEY_LEN, rngs[i].get());
+                encode_key(all_keys[k].data, uint64_t(k), space);
             }
         });
     }
@@ -390,6 +458,92 @@ void run_set() {
     threads.clear();
 }
 
+void run_update() {
+    fprintf(stderr, "UPDATE (nthreads=%d) start running...\n", kNumThreads);
+    std::vector<std::thread> threads;
+    monitor::evaluation monitor(logger, nupdates, kNumThreads, "UPDATE");
+    // upper bound speed = 100K per thread
+    uint64_t rps_per_thread = 100000;
+    if (rps > 0) rps_per_thread = rps * ngroups / kNumThreads;
+    for (uint32_t i = 0; i < kNumThreads; ++i) {
+        threads.emplace_back([i, &monitor, rps_per_thread]() {
+            constexpr uint64_t BNS = 1e6;
+            std::exponential_distribution<double> sampler(rps_per_thread / 1e9);
+            std::mt19937 rng(1235467 + i);
+            uint64_t t_start = rdtsc();
+            double t_dur = 0;
+
+            const uint64_t nops = nupdates;
+            if (nops <= i) return;
+            const uint64_t nops_i = (nops - i + kNumThreads - 1) / kNumThreads;
+
+            // Each key index belongs to exactly one thread (key % kNumThreads).
+            // This avoids concurrent updates to the same key, which would break
+            // the post-update GET validation (all_vals must match server state).
+            const uint64_t nkeys_i =
+                (kNumKVPairs > i)
+                    ? (uint64_t(kNumKVPairs - i) + kNumThreads - 1) /
+                          kNumThreads
+                    : 0;
+            assert(nkeys_i > 0);
+
+            int fd = connect_server(i % ngroups);
+            assert(fd >= 0);
+            std::vector<char> tx_buf(kBufferSize);
+            std::vector<char> rx_buf(kBufferSize);
+            for (uint64_t j = 0; j < nops_i; ++j) {
+                const uint64_t op = j * kNumThreads + i;
+                assert(op < nops);
+
+                t_dur += sampler(rng);
+                uint64_t p = rdtsc(), t_offset = 0;
+                uint64_t t_now = nanosecond(t_start, p);
+                if (t_now + BNS < t_dur) {
+                    my_nsleep(t_dur - t_now - (BNS / 2));
+                } else if (t_dur + BNS < t_now) {
+                    t_offset = t_now - t_dur - (BNS / 2);
+                }
+
+                const uint32_t key_idx =
+                    i + uint32_t((j % nkeys_i) * kNumThreads);
+                auto &key = all_keys[key_idx];
+                auto &val = all_vals[key_idx];
+                random_string(val.data, VAL_LEN, rngs[i].get());
+                char *payload = tx_buf.data() + kCrcPrefixMax;
+                size_t payload_len = prepare_setcmd(payload, key.data, val.data);
+                size_t len = prepend_crc_prefix(tx_buf.data(), kCrcPrefixMax,
+                                                payload, payload_len);
+
+                write_all(fd, tx_buf.data(), len);
+                size_t rx_len = read(fd, rx_buf.data(), kBufferSize);
+                monitor.latency[op] = nanosecond(p, rdtsc()) + t_offset;
+                assert(rx_len > 0);
+                if (strncmp(rx_buf.data(), kRetVals[kStored],
+                            sizeof(kRetVals[kStored]) - 1) != 0) {
+                    printf("Update error: key %s, ret %s\n",
+                           std::string(key.data, KEY_LEN).c_str(),
+                           std::string(rx_buf.data(), rx_len).c_str());
+                    assert(false);
+                }
+                monitor.cnts[i].c++;
+
+                uint64_t completed = (op + 1) * kNumPrints;
+                if (completed % nops < kNumPrints) {
+                    completed /= nops;
+                    if (completed % kNumThreads == i) {
+                        monitor.report();
+                    }
+                }
+            }
+            close(fd);
+        });
+    }
+    for (uint32_t i = 0; i < kNumThreads; ++i) {
+        threads[i].join();
+    }
+    threads.clear();
+}
+
 void run_get() {
     prepare_zipf_index();
     fprintf(stderr, "GET (nthreads=%d) start running...\n", kNumThreads);
@@ -470,14 +624,15 @@ void run_get() {
 }
 
 int main(int argc, char **argv) {
-    if (argc >= 10 || argc <= 1) {
+    if (argc > 10 || argc <= 1) {
         fprintf(stderr,
                 "Usage: %s <ip> <port> <log_file> <ngroups> <nclients> <nsets> "
-                "<ngets> <rps>\n",
+                "<ngets> <rps> [read_pct]\n",
                 argv[0]);
         fprintf(stderr,
                 "Default values: ip=127.0.0.1, port=6379, log_file=client.log, "
-                "ngroups=3, nclients=32, nsets=3<<24, ngets=1<<19, rps=0\n");
+                "ngroups=3, nclients=32, nsets=3<<24, ngets=1<<19, rps=0, "
+                "read_pct=(disabled)\n");
         return 1;
     }
     ip = argc >= 2 ? argv[1] : "127.0.0.1";
@@ -488,16 +643,36 @@ int main(int argc, char **argv) {
     nsets = argc >= 7 ? ngroups << atoi(argv[6]) : 3 << 24;
     ngets = argc >= 8 ? 1 << atoi(argv[7]) : 1 << 19;
     rps = argc >= 9 ? atoi(argv[8]) : 0;
+    if (argc >= 10) {
+        read_pct = atof(argv[9]);
+        if (read_pct <= 1.0) {
+            read_pct *= 100.0;
+        }
+        if (!(read_pct > 0.0 && read_pct <= 100.0)) {
+            fprintf(stderr, "Invalid read_pct: %f (expected 0<read_pct<=100)\n",
+                    read_pct);
+            return 1;
+        }
+    }
+
+    const uint64_t ngets_total = uint64_t(ngets) * uint64_t(nclients);
+    if (read_pct > 0.0) {
+        const double read_ratio = read_pct / 100.0;
+        nupdates = llround(double(ngets_total) * (1.0 - read_ratio) / read_ratio);
+        if (nupdates == 0) nupdates = 1;
+    } else {
+        nupdates = nsets;
+    }
     logger = fopen(output_file.c_str(), "a");
     fprintf(
         logger,
-        "client setting ngroups=%d, nclients=%d, nsets=%d, ngets=%d, rps=%d\n",
-        ngroups, nclients, nsets, ngets, rps);
+        "client setting ngroups=%d, nclients=%d, nsets=%d, nupdates=%lu, ngets=%d, read_pct=%.3f, rps=%d\n",
+        ngroups, nclients, nsets, nupdates, ngets, read_pct, rps);
     init_array();
     init_rng();
     prepare_key();
     run_set<kCreated>();  // set
-    run_set<kStored>();   // update
+    run_update();         // update
     run_get();            // get
     fclose(logger);
     return 0;
